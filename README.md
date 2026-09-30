@@ -1,6 +1,6 @@
 # wipestick
 
-A bootable USB that erases every internal drive in a PC and leaves it ready for a fresh OS install. It uses the drive's own firmware erase commands first, so SSDs and NVMe drives get almost no wear. All components are open source (GPL-3.0-or-later for this project; Ubuntu packages under their own licenses).
+A bootable USB that erases every internal drive in a PC and leaves it ready for a fresh OS install. It uses the drive's own firmware erase commands first, so SSDs and NVMe drives get almost no wear. All components are open source (GPL-3.0-or-later for this project; Debian packages under their own licenses).
 
 ## How it works
 
@@ -21,27 +21,34 @@ A bootable USB that erases every internal drive in a PC and leaves it ready for 
 
 ## Build
 
-On Ubuntu 24.04 or Debian 12+ as root:
+The primary build is **Debian 13 (trixie) with live-build**. There are two ways to run it.
+
+**GitHub Actions (recommended).** Push this repo to GitHub. `.github/workflows/build.yml` lints the scripts, builds the ISO in a `debian:trixie` container, boot-tests it in QEMU (UEFI with Secure Boot enforced, and legacy BIOS), and uploads the ISO as a build artifact. Pushing a tag like `v0.2.0` also publishes it as a GitHub Release.
+
+**Any Debian machine** (VM, WSL2, or a container run with `--privileged`), as root:
 
 ```bash
-apt install debootstrap squashfs-tools xorriso mtools dosfstools gdisk grub-pc-bin grub-common
-sudo ./build/build-iso.sh            # -> wipestick.iso (~350 MB, about 5 minutes)
-sudo ./build/make-usb.sh wipestick.iso /dev/sdX
+apt install live-build
+sudo ./build/build-debian.sh          # -> wipestick-debian.iso
 ```
 
-`make-usb.sh` creates a FAT32 UEFI stick with a writable `wipelogs/` folder. Rufus in "ISO image mode" on Windows produces an equivalent stick.
-Writing the ISO raw (`dd`, balenaEtcher) also works and adds legacy-BIOS boot, but logs then live in RAM only.
+**Ubuntu alternative:** `build/build-ubuntu.sh` builds an Ubuntu 24.04 image with a newer (HWE) kernel, for very new hardware. It needs `debootstrap squashfs-tools xorriso mtools dosfstools gdisk grub-pc-bin grub-common`.
+
+**Write a stick:**
+
+```bash
+sudo ./build/make-usb.sh wipestick-debian.iso /dev/sdX
+```
+
+`make-usb.sh` creates a FAT32 UEFI stick with a writable `wipelogs/` folder. Rufus in "ISO image mode" on Windows produces an equivalent stick. Writing the ISO raw (`dd`, balenaEtcher, Rufus "DD mode") also works and adds legacy-BIOS boot, but logs then live in RAM only.
 
 ## Boot menu
 
-- **erase drives**: default. Uses `nomodeset` (basic framebuffer), which works on nearly all UEFI machines without GPU firmware.
-- **run from RAM**: copies the system to memory. Use it if the stick is flaky after the SATA unfreeze suspend.
-- **graphics drivers enabled**: use it if the screen stays blank with the default entry.
-- **Firmware setup**: reboots into UEFI setup (to switch RAID/VMD to AHCI, for example).
+The Debian image uses live-build's standard menus (GRUB on UEFI, syslinux on BIOS). The default entry boots with `nomodeset` (basic framebuffer), which works on nearly all machines without GPU firmware. To run from RAM, press `e` (GRUB) or `Tab` (syslinux) and add `toram`. The Ubuntu image has these as separate menu entries, plus a firmware-setup entry.
 
 ## Known limits and fixes
 
-- **Secure Boot:** works via Canonical's signed shim. On Snapdragon/ARM PCs and some Secured-core laptops the third-party UEFI CA is off by default; enable "Allow Microsoft 3rd-party UEFI CA" or disable Secure Boot.
+- **Secure Boot:** works via the distribution's Microsoft-signed shim (Debian's or Canonical's). Microsoft's 2011 third-party signing certificate expired in June 2026; test on your oldest machines with Secure Boot on. On Snapdragon/ARM PCs and some Secured-core laptops the third-party UEFI CA is off by default; enable "Allow Microsoft 3rd-party UEFI CA" or disable Secure Boot.
 - **Intel RST/VMD or RAID mode:** drives may be hidden or reject erase commands. Switch storage mode to AHCI in firmware setup.
 - **Frozen SATA drives:** the tool suspends the machine for 6 seconds to unfreeze them. If that fails (common on desktops with s2idle-only sleep), hot-plug the drive's SATA power after boot, or use another port.
 - **Self-encrypting drives (Opal) with locking enabled / ATA-password-locked drives:** reported as failed with a hint. Fix with a PSID revert using the PSID printed on the drive label (`sedutil-cli --PSIDrevert`; not bundled yet).
@@ -59,31 +66,43 @@ wipestick --dry-run erase --confirm ERASE /dev/nvme0n1 /dev/sda
 wipestick erase --confirm ERASE /dev/nvme0n1
 ```
 
-The TUI starts automatically on tty1. Choose "Drop to a root shell" from its end menu for manual work.
+The TUI starts automatically on tty1. Choose "Drop to a root shell" from its end menu for manual work. On the Debian image, tty2-tty6 also offer a login as `user` / password `live` (live-config defaults; `sudo` works).
 
 ## Project layout
 
 ```
-src/wipestick          erase engine (bash)
-src/wipestick-tui      whiptail front end
-overlay/               files copied into the live system (systemd unit)
-build/build-iso.sh     builds the hybrid ISO
-build/make-usb.sh      writes a FAT32 UEFI stick with persistent logs
+src/wipestick                erase engine (bash)
+src/wipestick-tui            whiptail front end
+overlay/                     files copied into the live system (systemd units, self-test)
+live/                        Debian live-build config (auto/, package list, hook)
+build/build-debian.sh        builds the Debian ISO (primary)
+build/build-ubuntu.sh        builds the Ubuntu ISO (alternative, newer kernel)
+build/make-usb.sh            writes a FAT32 UEFI stick with persistent logs
+tests/qemu-selftest.sh       boots an ISO in QEMU and runs the self-test
+.github/workflows/build.yml  CI: lint, build, boot-test, release
 ```
+
+## Self-test
+
+`tests/qemu-selftest.sh wipestick.iso uefi-sb|bios` boots the image in QEMU with an NVMe drive and a SATA drive full of random data and partitions. The live system runs `wipestick-selftest`, which erases the test drives and powers off. The test passes when the log shows PASS, both drives read back as all zeros, and the boot disk was not listed.
+
+The self-test only runs when the VM's SMBIOS OEM strings contain `wipestick-selftest`, and it only erases drives whose serial starts with `WSTEST`. Real hardware never matches either, so on a real machine the service does nothing.
 
 ## Test status
 
 Tested in QEMU (no real hardware yet):
 
-| Test | Result |
-|---|---|
-| UEFI boot with Secure Boot enforced (OVMF, Microsoft keys) from FAT32 USB | Pass |
-| Legacy BIOS boot of the raw ISO from a SATA disk | Pass |
-| Boot medium excluded from the drive list (both USB and SATA boot) | Pass |
-| NVMe Format SES=1, verified by canaries | Pass |
-| SATA TRIM that silently did nothing, caught by canaries, fell back to zero pass | Pass |
-| Wrong confirmation text erases nothing | Pass |
-| Reports persisted to `wipelogs/` on the stick | Pass |
+| Test | Ubuntu (casper) | Debian boot path (live-boot)* | Debian build (live-build) |
+|---|---|---|---|
+| UEFI boot, Secure Boot enforced, from USB | Pass | Pass | Not yet run (CI) |
+| Legacy BIOS boot, raw ISO on a SATA disk | Pass | Pass | Not yet run (CI) |
+| Boot medium excluded from the drive list | Pass | Pass | Not yet run (CI) |
+| NVMe Format SES=1, verified by canaries | Pass | Pass | Not yet run (CI) |
+| TRIM that did nothing, caught, fell back to zero pass | Pass | Pass | Not yet run (CI) |
+| Reports persisted to `wipelogs/` on a FAT32 stick | Pass | Pass | Not yet run (CI) |
+| Wrong confirmation text erases nothing | Pass | Not run | Not yet run |
+
+\* An Ubuntu build using Debian's live-boot (`LIVEBOOT=1 build/build-ubuntu.sh`). It exercises the same boot and medium-mount path as the Debian image, which could not be built where this was developed.
 
 **Not yet tested on real drives:** NVMe Sanitize, NVMe crypto Format, ATA Sanitize, ATA Security Erase, and the suspend-to-unfreeze step. QEMU does not emulate these. Test them on a few spare machines before relying on the tool, and start with `--dry-run` from the root shell.
 

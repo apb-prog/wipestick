@@ -1,0 +1,16 @@
+#!/bin/sh
+# Runs inside the chroot after packages are installed.
+set -e
+
+systemctl enable wipestick.service wipestick-selftest.service
+systemctl mask getty@tty1.service apt-daily.timer apt-daily-upgrade.timer \
+  mdmonitor.service lvm2-monitor.service 2>/dev/null || true
+
+# Never auto-assemble RAID or activate LVM on drives we are about to erase.
+mkdir -p /etc/mdadm
+sed -i '/^AUTO /d' /etc/mdadm/mdadm.conf 2>/dev/null || true
+echo "AUTO -all" >> /etc/mdadm/mdadm.conf
+sed -i 's/# *event_activation = 1/event_activation = 0/' /etc/lvm/lvm.conf 2>/dev/null || true
+
+echo wipestick > /etc/hostname
+rm -rf /usr/share/doc/* /usr/share/man/* /usr/share/info/*

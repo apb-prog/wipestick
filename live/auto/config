@@ -1,0 +1,27 @@
+#!/bin/sh
+# Debian live-build configuration for wipestick.
+# Run via build/build-debian.sh (which syncs src/ and overlay/ first).
+set -e
+
+lb config noauto \
+  --mode debian \
+  --distribution "${WIPESTICK_SUITE:-trixie}" \
+  --architecture amd64 \
+  --archive-areas "main" \
+  --linux-flavours amd64 \
+  --binary-images iso-hybrid \
+  --bootloaders "grub-efi,syslinux" \
+  --uefi-secure-boot enable \
+  --debian-installer none \
+  --memtest none \
+  --apt-recommends false \
+  --apt-indices false \
+  --firmware-binary false \
+  --firmware-chroot false \
+  --security true \
+  --updates true \
+  --iso-volume "WIPESTICK" \
+  --iso-application "wipestick" \
+  --iso-publisher "wipestick project" \
+  --bootappend-live "boot=live components quiet loglevel=3 nomodeset noeject live-config.hostname=wipestick" \
+  "${@}"

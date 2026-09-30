@@ -1,0 +1,31 @@
+# Live system plumbing
+live-boot
+live-config
+live-config-systemd
+systemd-sysv
+dbus
+kbd
+
+# Erase engine
+nvme-cli
+hdparm
+gdisk
+parted
+util-linux
+util-linux-extra
+dosfstools
+e2fsprogs
+jq
+dmidecode
+pciutils
+smartmontools
+
+# Tear down RAID / LVM / LUKS on target drives before erasing
+lvm2
+mdadm
+cryptsetup-bin
+
+# Front end and rescue tools
+whiptail
+less
+nano

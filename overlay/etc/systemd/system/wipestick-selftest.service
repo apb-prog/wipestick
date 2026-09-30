@@ -1,0 +1,13 @@
+[Unit]
+Description=wipestick CI self-test (QEMU only)
+After=systemd-udevd.service local-fs.target
+Before=wipestick.service
+
+[Service]
+Type=oneshot
+ExecCondition=/bin/sh -c 'dmidecode -t 11 2>/dev/null | grep -q wipestick-selftest'
+ExecStart=/usr/local/sbin/wipestick-selftest
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target

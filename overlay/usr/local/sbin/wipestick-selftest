@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# CI self-test. Runs ONLY when the VM's SMBIOS OEM strings contain
+# "wipestick-selftest" (QEMU: -smbios type=11,value=wipestick-selftest),
+# and erases ONLY drives whose serial starts with WSTEST. Real hardware
+# never matches either condition.
+# SPDX-License-Identifier: GPL-3.0-or-later
+set -uo pipefail
+exec >/dev/ttyS0 2>&1
+echo "WIPESTICK-SELFTEST-BEGIN"
+fail=0
+udevadm settle --timeout=30
+sleep 2
+
+list=$(wipestick list)
+echo "$list"
+if grep -q 'WSBOOT' <<<"$list"; then echo "FAIL: boot disk is listed as erasable"; fail=1; fi
+
+targets=()
+while IFS=$'\037' read -r dev _ _ _ serial _; do
+  [[ $serial == WSTEST* ]] && targets+=("$dev")
+done < <(tail -n +2 <<<"$list" | tr '\t' '\037')   # tabs collapse empty fields
+echo "targets: ${targets[*]:-none}"
+(( ${#targets[@]} )) || { echo "FAIL: no WSTEST drives found"; fail=1; }
+
+if (( ${#targets[@]} )); then
+  wipestick plan "${targets[@]}"
+  wipestick erase --confirm ERASE "${targets[@]}" || { echo "FAIL: erase returned non-zero"; fail=1; }
+  cat /run/wipestick/summary 2>/dev/null
+  logdir=$(cat /run/wipestick/log_dir 2>/dev/null)
+  echo "log dir: $logdir"
+  ls -la "$logdir" 2>/dev/null
+fi
+
+if (( fail )); then echo "WIPESTICK-SELFTEST-FAIL"; else echo "WIPESTICK-SELFTEST-PASS"; fi
+sync
+systemctl poweroff 2>/dev/null || poweroff -f

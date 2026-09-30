@@ -1,2 +1,16 @@
-work/
 *.iso
+work/
+# live-build outputs and generated config
+live/.build/
+live/cache/
+live/chroot/
+live/binary/
+live/chroot.*
+live/binary.*
+live/build.log
+live/config/includes.chroot/
+live/config/binary
+live/config/bootstrap
+live/config/chroot
+live/config/common
+live/config/source

@@ -422,12 +422,16 @@ init_logs() {
       mountpoint -q /mnt/wipelogs || mount "$part" /mnt/wipelogs 2>/dev/null
       mountpoint -q /mnt/wipelogs && LOG_DIR=/mnt/wipelogs/wipelogs
     fi
-    if [[ -z $LOG_DIR ]] && mountpoint -q /cdrom; then
-      fstype=$(findmnt -no FSTYPE /cdrom)
-      if [[ $fstype == vfat ]] && mount -o remount,rw /cdrom 2>/dev/null; then
-        LOG_DIR=/cdrom/wipelogs
+    # Boot medium: /cdrom (Ubuntu casper) or /run/live/medium (Debian live-boot).
+    # If it is a FAT32 stick (make-usb.sh / Rufus), remount it writable for logs.
+    local medium
+    for medium in /run/live/medium /cdrom; do
+      [[ -z $LOG_DIR ]] && mountpoint -q "$medium" || continue
+      fstype=$(findmnt -no FSTYPE "$medium")
+      if [[ $fstype == vfat ]] && mount -o remount,rw "$medium" 2>/dev/null; then
+        LOG_DIR=$medium/wipelogs
       fi
-    fi
+    done
     [[ -z $LOG_DIR ]] && LOG_DIR=$STATE_DIR/logs
   fi
   mkdir -p "$LOG_DIR"

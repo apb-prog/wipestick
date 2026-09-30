@@ -5,7 +5,9 @@
 # Requirements on the build host (Ubuntu/Debian, run as root):
 #   apt install debootstrap squashfs-tools xorriso mtools dosfstools grub-pc-bin grub-common
 #
-# Usage: sudo ./build/build-iso.sh [output.iso]
+# Usage: sudo ./build/build-ubuntu.sh [output.iso]
+# Env:   LIVEBOOT=1  use Debian's live-boot instead of casper (mirrors the
+#                    Debian build's boot path; used to test it without Debian mirrors)
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 set -euo pipefail
@@ -19,8 +21,13 @@ VOLID="WIPESTICK"
 CHROOT=$WORK/chroot
 IMAGE=$WORK/image
 
+if [[ ${LIVEBOOT:-0} == 1 ]]; then
+  LIVEPKG=(live-boot live-boot-initramfs-tools); LIVEDIR=live; BOOTARG="boot=live components noeject"
+else
+  LIVEPKG=(casper); LIVEDIR=casper; BOOTARG="boot=casper noprompt"
+fi
 PACKAGES=(
-  casper initramfs-tools systemd-sysv udev kmod dbus
+  "${LIVEPKG[@]}" initramfs-tools systemd-sysv udev kmod dbus
   nvme-cli hdparm gdisk parted util-linux dosfstools e2fsprogs
   whiptail jq dmidecode pciutils smartmontools
   lvm2 mdadm cryptsetup-bin
@@ -37,7 +44,7 @@ trap cleanup EXIT
 in_chroot() { chroot "$CHROOT" /usr/bin/env DEBIAN_FRONTEND=noninteractive LC_ALL=C "$@"; }
 
 echo "==> [1/7] bootstrap $SUITE"
-rm -rf "$WORK"; mkdir -p "$CHROOT" "$IMAGE"/{casper,boot/grub,EFI/BOOT,.disk}
+rm -rf "$WORK"; mkdir -p "$CHROOT" "$IMAGE"/{"$LIVEDIR",boot/grub,EFI/BOOT,.disk}
 debootstrap --variant=minbase --arch=amd64 --components=main,universe "$SUITE" "$CHROOT" "$MIRROR"
 
 for m in dev dev/pts proc sys run; do mount --bind "/$m" "$CHROOT/$m"; done
@@ -74,7 +81,7 @@ install -m 0755 "$ROOT/src/wipestick"     "$CHROOT/usr/local/sbin/wipestick"
 install -m 0755 "$ROOT/src/wipestick-tui" "$CHROOT/usr/local/sbin/wipestick-tui"
 cp -a "$ROOT/overlay/." "$CHROOT/"
 echo wipestick > "$CHROOT/etc/hostname"
-in_chroot systemctl enable wipestick.service
+in_chroot systemctl enable wipestick.service wipestick-selftest.service
 in_chroot systemctl mask getty@tty1.service apt-daily.timer apt-daily-upgrade.timer \
   motd-news.timer mdmonitor.service lvm2-monitor.service 2>/dev/null || true
 # Never auto-assemble RAID or activate LVM on the drives we are about to erase.
@@ -94,32 +101,32 @@ GCD=$(find "$DEBS/x" -name 'gcdx64.efi.signed' | head -n1)
 [[ -f $SHIM && -f $GCD ]] || { echo "signed shim/grub not found" >&2; exit 1; }
 
 echo "==> [5/7] squashfs"
-cp "$CHROOT/boot/vmlinuz-$KVER" "$IMAGE/casper/vmlinuz"
-cp "$CHROOT/boot/initrd.img-$KVER" "$IMAGE/casper/initrd"
+cp "$CHROOT/boot/vmlinuz-$KVER" "$IMAGE/$LIVEDIR/vmlinuz"
+cp "$CHROOT/boot/initrd.img-$KVER" "$IMAGE/$LIVEDIR/initrd"
 in_chroot apt-get clean
 rm -rf "$CHROOT"/var/lib/apt/lists/* "$CHROOT"/tmp/* "$CHROOT"/usr/share/doc/* "$CHROOT"/usr/share/man/*
 cleanup
-mksquashfs "$CHROOT" "$IMAGE/casper/filesystem.squashfs" -comp zstd -Xcompression-level 19 -noappend -quiet
-du -sx --block-size=1 "$CHROOT" | cut -f1 > "$IMAGE/casper/filesystem.size"
+mksquashfs "$CHROOT" "$IMAGE/$LIVEDIR/filesystem.squashfs" -comp zstd -Xcompression-level 19 -noappend -quiet
+du -sx --block-size=1 "$CHROOT" | cut -f1 > "$IMAGE/$LIVEDIR/filesystem.size"
 
 echo "==> [6/7] bootloaders"
 echo "wipestick $(sed -n 's/^VERSION="\(.*\)"/\1/p' "$ROOT/src/wipestick") ($SUITE amd64) $(date -u +%Y%m%d)" > "$IMAGE/.disk/info"
-CMDLINE="boot=casper noprompt quiet loglevel=3 fsck.mode=skip systemd.show_status=0"
+CMDLINE="$BOOTARG quiet loglevel=3 fsck.mode=skip systemd.show_status=0"
 cat > "$IMAGE/boot/grub/grub.cfg" <<EOF
 set timeout=5
 set default=0
 insmod all_video
 menuentry "wipestick - erase drives" {
-  linux /casper/vmlinuz $CMDLINE nomodeset
-  initrd /casper/initrd
+  linux /$LIVEDIR/vmlinuz $CMDLINE nomodeset
+  initrd /$LIVEDIR/initrd
 }
 menuentry "wipestick - erase drives (run from RAM; USB can be removed)" {
-  linux /casper/vmlinuz $CMDLINE nomodeset toram
-  initrd /casper/initrd
+  linux /$LIVEDIR/vmlinuz $CMDLINE nomodeset toram
+  initrd /$LIVEDIR/initrd
 }
 menuentry "wipestick - graphics drivers enabled (if the screen stays blank)" {
-  linux /casper/vmlinuz $CMDLINE
-  initrd /casper/initrd
+  linux /$LIVEDIR/vmlinuz $CMDLINE
+  initrd /$LIVEDIR/initrd
 }
 menuentry "Firmware setup (UEFI only)" {
   fwsetup
