@@ -18,7 +18,7 @@ jobs:
       - run: >
           shellcheck -S warning src/wipestick src/wipestick-tui
           overlay/usr/local/sbin/wipestick-selftest build/*.sh tests/*.sh
-          live/auto/* live/config/hooks/normal/*.chroot
+          live/auto/* live/config/hooks/normal/*.chroot live/config/hooks/normal/*.binary
 
   build:
     needs: lint
@@ -73,7 +73,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: serial-${{ matrix.mode }}
-          path: ${{ runner.temp }}/st/serial.log
+          path: |
+            ${{ runner.temp }}/st/serial.log
+            ${{ runner.temp }}/st/shot-*.ppm
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

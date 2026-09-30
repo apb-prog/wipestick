@@ -44,7 +44,7 @@ sudo ./build/make-usb.sh wipestick-debian.iso /dev/sdX
 
 ## Boot menu
 
-The Debian image uses live-build's standard menus (GRUB on UEFI, syslinux on BIOS). The default entry boots with `nomodeset` (basic framebuffer), which works on nearly all machines without GPU firmware. To run from RAM, press `e` (GRUB) or `Tab` (syslinux) and add `toram`. The Ubuntu image has these as separate menu entries, plus a firmware-setup entry.
+The Debian image uses live-build's standard menus (GRUB on UEFI, syslinux on BIOS), set by a build hook to boot the default entry after 5 seconds. The default entry boots with `nomodeset` (basic framebuffer), which works on nearly all machines without GPU firmware. To run from RAM, press `e` (GRUB) or `Tab` (syslinux) and add `toram`. The Ubuntu image has these as separate menu entries, plus a firmware-setup entry.
 
 ## Known limits and fixes
 
@@ -94,12 +94,12 @@ Tested in QEMU (no real hardware yet):
 
 | Test | Ubuntu (casper) | Debian boot path (live-boot)* | Debian build (live-build) |
 |---|---|---|---|
-| UEFI boot, Secure Boot enforced, from USB | Pass | Pass | Not yet run (CI) |
-| Legacy BIOS boot, raw ISO on a SATA disk | Pass | Pass | Not yet run (CI) |
-| Boot medium excluded from the drive list | Pass | Pass | Not yet run (CI) |
-| NVMe Format SES=1, verified by canaries | Pass | Pass | Not yet run (CI) |
-| TRIM that did nothing, caught, fell back to zero pass | Pass | Pass | Not yet run (CI) |
-| Reports persisted to `wipelogs/` on a FAT32 stick | Pass | Pass | Not yet run (CI) |
+| UEFI boot, Secure Boot enforced, from USB | Pass | Pass | Pass |
+| Legacy BIOS boot, raw ISO on a SATA disk | Pass | Pass | Pass |
+| Boot medium excluded from the drive list | Pass | Pass | Pass |
+| NVMe Format SES=1, verified by canaries | Pass | Pass | Pass |
+| TRIM that did nothing, caught, fell back to zero pass | Pass | Pass | Pass |
+| Reports persisted to `wipelogs/` on a FAT32 stick | Pass | Pass | Not yet run |
 | Wrong confirmation text erases nothing | Pass | Not run | Not yet run |
 
 \* An Ubuntu build using Debian's live-boot (`LIVEBOOT=1 build/build-ubuntu.sh`). It exercises the same boot and medium-mount path as the Debian image, which could not be built where this was developed.

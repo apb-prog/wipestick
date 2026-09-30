@@ -1,0 +1,15 @@
+#!/bin/sh
+# Boot the default menu entry automatically after 5 s. live-build's GRUB
+# config sets no timeout and its syslinux config uses "timeout 0", so both
+# menus otherwise wait forever for a key press.
+set -e
+[ -d binary/boot ] && cd binary   # run from either the build root or binary/
+
+if [ -f boot/grub/config.cfg ]; then
+  sed -i '/^set timeout=/d; /^insmod play$/d; /^play /d' boot/grub/config.cfg
+  sed -i '1i set timeout=5' boot/grub/config.cfg
+fi
+if [ -f isolinux/isolinux.cfg ]; then
+  sed -i 's/^timeout .*/timeout 50/' isolinux/isolinux.cfg
+  grep -q '^timeout ' isolinux/isolinux.cfg || echo 'timeout 50' >> isolinux/isolinux.cfg
+fi

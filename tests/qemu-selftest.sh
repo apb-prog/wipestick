@@ -38,7 +38,8 @@ COMMON=(
   -drive file=nvme.img,if=none,id=nv,format=raw -device nvme,drive=nv,serial=WSTEST-NVME
   -device ahci,id=ahci
   -drive file=sata.img,if=none,id=sd,format=raw -device ide-hd,drive=sd,bus=ahci.0,serial=WSTEST-SATA,rotation_rate=1
-  -display none -serial file:serial.log -no-reboot
+  -display none -vga std -serial file:serial.log -no-reboot
+  -monitor unix:monitor.sock,server,nowait
 )
 
 case $MODE in
@@ -65,9 +66,29 @@ esac
 
 rm -f serial.log
 echo "booting ($MODE, ${ACCEL[1]}), timeout ${TIMEOUT}s, work dir $WORK"
+# Screenshot the VM console every 60 s (shot-NN.ppm) so a hang shows where it stopped.
+screens() {
+  local n=0
+  sleep 20
+  while [[ -S monitor.sock ]]; do
+    n=$(( n + 1 ))
+    python3 - "$n" <<'PY' 2>/dev/null || true
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX); s.connect("monitor.sock"); time.sleep(0.3); s.recv(4096)
+s.send(("screendump shot-%02d.ppm\n" % int(sys.argv[1])).encode()); time.sleep(1); s.close()
+PY
+    sleep 60
+  done
+}
+rm -f shot-*.ppm monitor.sock
 set +e
-timeout "$TIMEOUT" qemu-system-x86_64 "${COMMON[@]}" "${BOOT[@]}"
+timeout "$TIMEOUT" qemu-system-x86_64 "${COMMON[@]}" "${BOOT[@]}" &
+qpid=$!
+screens &
+spid=$!
+wait "$qpid"
 qrc=$?
+kill "$spid" 2>/dev/null
 set -e
 echo "----- serial log -----"; cat serial.log 2>/dev/null; echo "----------------------"
 
