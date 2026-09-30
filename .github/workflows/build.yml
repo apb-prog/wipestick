@@ -31,7 +31,10 @@ jobs:
       - name: Install live-build
         run: apt-get update -qq && apt-get install -y -qq live-build
       - name: Build ISO
-        run: ./build/build-debian.sh "$GITHUB_WORKSPACE/wipestick.iso"
+        # chmod guards against exec bits lost when the repo passed through Windows
+        run: |
+          chmod +x src/* overlay/usr/local/sbin/* build/*.sh tests/*.sh live/auto/* live/config/hooks/normal/*
+          bash ./build/build-debian.sh "$GITHUB_WORKSPACE/wipestick.iso"
       - run: sha256sum wipestick.iso > wipestick.iso.sha256
       - uses: actions/upload-artifact@v4
         with:
@@ -65,7 +68,7 @@ jobs:
           sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq qemu-system-x86 ovmf gdisk
       - name: Boot and self-test (${{ matrix.mode }})
-        run: tests/qemu-selftest.sh wipestick.iso ${{ matrix.mode }} "$RUNNER_TEMP/st"
+        run: bash tests/qemu-selftest.sh wipestick.iso ${{ matrix.mode }} "$RUNNER_TEMP/st"
       - if: always()
         uses: actions/upload-artifact@v4
         with:
