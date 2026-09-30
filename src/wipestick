@@ -1,0 +1,560 @@
+#!/usr/bin/env bash
+# wipestick — firmware-first drive sanitizer for a bootable USB.
+#
+# Philosophy: ask the drive to erase itself (NVMe Sanitize / Format with
+# Secure Erase, ATA Sanitize / Security Erase). These are fast and cause
+# almost no flash wear. Fall back to TRIM, then a single zero pass, only
+# when firmware methods are unavailable or fail verification.
+#
+# Every erase is verified with "canaries": random 4 KiB blocks written at
+# spread-out offsets before the erase and read back afterwards. If any
+# canary survives, the method is treated as failed and the next one is tried.
+#
+# Usage:
+#   wipestick list                      # eligible drives (TSV)
+#   wipestick plan  <dev>...            # show which methods will be tried
+#   wipestick erase --confirm ERASE <dev>...
+# Options (before the subcommand):
+#   --dry-run       print destructive commands instead of running them
+#   --allow-usb     include USB-attached drives in the eligible list
+#   --no-suspend    never suspend to unfreeze SATA drives
+#   --log-dir DIR   override log location
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+set -uo pipefail
+
+VERSION="0.1.0"
+DRY_RUN=0
+ALLOW_USB=0
+ALLOW_SUSPEND=1
+LOG_DIR="${WIPESTICK_LOG_DIR:-}"
+CANARY_COUNT=16
+CANARY_BS=4096
+ATA_PASS="wipestick"
+STATE_DIR="/run/wipestick"
+RUN_LOG="/dev/null"
+
+# ---------------------------------------------------------------- utilities
+
+die()  { echo "wipestick: $*" >&2; exit 2; }
+ts()   { date -u +%Y-%m-%dT%H:%M:%SZ; }
+log()  { printf '%s %s\n' "$(ts)" "$*" | tee -a "$RUN_LOG" >&2; }
+info() { printf '    %s\n' "$*" | tee -a "$RUN_LOG" >&2; }
+
+# Run a destructive command (or print it in dry-run mode).
+run() {
+  if (( DRY_RUN )); then
+    info "[dry-run] $*"
+    return 0
+  fi
+  info "+ $*"
+  "$@" 2>&1 | tee -a "$RUN_LOG" >&2
+  return "${PIPESTATUS[0]}"
+}
+
+need_root() { [[ $EUID -eq 0 ]] || die "must run as root"; }
+
+devname() { basename "$1"; }
+
+parent_disk() {
+  local pk
+  pk=$(lsblk -no PKNAME "$1" 2>/dev/null | head -n1)
+  if [[ -n $pk ]]; then echo "/dev/$pk"; else echo "$1"; fi
+}
+
+# Disks that must never be touched: the boot medium and anything backing /.
+protected_disks() {
+  local m src
+  for m in /cdrom /run/live/medium /lib/live/mount/medium /mnt/wipelogs; do
+    src=$(findmnt -no SOURCE "$m" 2>/dev/null) || continue
+    [[ $src == /dev/* ]] && parent_disk "$src"
+  done
+  src=$(findmnt -no SOURCE / 2>/dev/null)
+  [[ $src == /dev/* ]] && parent_disk "$src"
+  src=$(blkid -L WIPELOGS 2>/dev/null) && parent_disk "$src"
+  return 0
+}
+
+is_protected() {
+  local d
+  while read -r d; do [[ -n $d && $d == "$1" ]] && return 0; done < <(protected_disks | sort -u)
+  return 1
+}
+
+classify() {
+  local dev=$1 name tran rota
+  name=$(devname "$dev")
+  case $name in
+    nvme*)   echo nvme; return ;;
+    mmcblk*) echo mmc;  return ;;
+  esac
+  rota=$(cat "/sys/block/$name/queue/rotational" 2>/dev/null || echo 0)
+  tran=$(lsblk -dno TRAN "$dev" 2>/dev/null | tr -d ' ')
+  if [[ $rota == 1 ]]; then echo hdd
+  elif [[ $tran == sata || $tran == ata ]]; then echo sata-ssd
+  else echo ssd-other
+  fi
+}
+
+size_bytes() { blockdev --getsize64 "$1"; }
+
+human() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1"; }
+
+# ------------------------------------------------------------- enumeration
+
+eligible_drives() {
+  local name path tran type
+  while read -r name type tran; do
+    path="/dev/$name"
+    [[ $type == disk || ( $type == loop && ${WIPESTICK_TEST_LOOP:-0} == 1 ) ]] || continue
+    case $name in
+      loop*) [[ ${WIPESTICK_TEST_LOOP:-0} == 1 ]] || continue ;;   # test hook only
+      zram*|ram*|sr*|fd*|nbd*|md*|dm-*) continue ;;
+    esac
+    [[ $name == mmcblk*boot* || $name == mmcblk*rpmb ]] && continue
+    [[ $tran == usb && $ALLOW_USB -eq 0 ]] && continue
+    is_protected "$path" && continue
+    [[ $(size_bytes "$path" 2>/dev/null || echo 0) -gt 0 ]] || continue
+    echo "$path"
+  done < <(lsblk -dnro NAME,TYPE,TRAN 2>/dev/null | awk '{print $1, $2, ($3==""?"-":$3)}')
+}
+
+cmd_list() {
+  local d
+  printf 'DEVICE\tCLASS\tSIZE\tMODEL\tSERIAL\tTRAN\n'
+  for d in $(eligible_drives); do
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$d" "$(classify "$d")" \
+      "$(human "$(size_bytes "$d")")" \
+      "$(lsblk -dno MODEL "$d" | sed 's/[[:space:]]*$//')" \
+      "$(lsblk -dno SERIAL "$d" | sed 's/[[:space:]]*$//')" \
+      "$(lsblk -dno TRAN "$d" | tr -d ' ')"
+  done
+}
+
+# Platform-level warnings that explain missing drives or failed commands.
+platform_warnings() {
+  if compgen -G '/sys/bus/pci/drivers/vmd/*:*' >/dev/null; then
+    echo "Intel VMD/RST is active. NVMe erase commands may be blocked; set storage mode to AHCI in firmware setup if erases fail."
+  fi
+  if lspci -n 2>/dev/null | awk '{print $2}' | grep -q '^0104'; then
+    echo "A RAID-mode storage controller is present. Drives behind it may be hidden; switch to AHCI in firmware setup."
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------- nvme helpers
+
+nvme_ctrl() {
+  # /sys/block/nvme0n1/device -> .../nvme0
+  echo "/dev/$(basename "$(readlink -f "/sys/block/$(devname "$1")/device")")"
+}
+
+nvme_idctrl_field() { nvme id-ctrl "$1" -o json 2>/dev/null | jq -r ".$2 // 0"; }
+
+nvme_ns_count() {
+  local c
+  c=$(devname "$1")
+  find /sys/class/nvme/"$c"/ -maxdepth 1 -name "${c}n*" 2>/dev/null | grep -c . || true
+}
+
+nvme_sstat() {
+  nvme sanitize-log "$1" -o json 2>/dev/null |
+    jq -r '[.. | objects | select(has("sstat"))][0] | "\(.sstat) \(.sprog)"' 2>/dev/null
+}
+
+nvme_sanitize() {
+  local dev=$1 act=$2 ctrl st prog code waited=0
+  ctrl=$(nvme_ctrl "$dev")
+  run nvme sanitize "$ctrl" --sanact="$act" || return 1
+  (( DRY_RUN )) && return 0
+  sleep 2
+  while :; do
+    read -r st prog < <(nvme_sstat "$ctrl")
+    code=$(( ${st:-0} & 7 ))
+    case $code in
+      2) info "sanitize in progress: $(( ${prog:-0} * 100 / 65535 ))%";;
+      1|4) info "sanitize completed (sstat=$st)"; break ;;
+      3) info "sanitize reported FAILURE (sstat=$st)"
+         run nvme sanitize "$ctrl" --sanact=1 >/dev/null 2>&1   # exit failure mode
+         return 1 ;;
+      *) info "unexpected sanitize status (sstat=${st:-none})"; (( waited > 30 )) && return 1 ;;
+    esac
+    sleep 5; waited=$(( waited + 5 ))
+    (( waited > 14400 )) && { info "sanitize timed out after 4h"; return 1; }
+  done
+  nvme ns-rescan "$ctrl" >/dev/null 2>&1 || true
+  sleep 1
+  return 0
+}
+
+nvme_format() {
+  local dev=$1 ses=$2 flbas lbaf
+  flbas=$(nvme id-ns "$dev" -o json 2>/dev/null | jq -r '.flbas // 0')
+  lbaf=$(( flbas & 0xF ))
+  run nvme format "$dev" --ses="$ses" --lbaf="$lbaf" --force --timeout=3600000 || return 1
+  nvme ns-rescan "$(nvme_ctrl "$dev")" >/dev/null 2>&1 || true
+  sleep 1
+}
+
+# -------------------------------------------------------------- ata helpers
+
+ata_info() { hdparm -I "$1" 2>/dev/null; }
+
+ata_security_block() { ata_info "$1" | sed -n '/^Security:/,/^[^[:space:]]/p'; }
+
+ata_has()  { ata_info "$1" | grep -q "$2"; }
+
+ata_frozen() { ata_security_block "$1" | grep -qP '^\s+frozen'; }
+ata_locked() { ata_security_block "$1" | grep -qP '^\s+locked'; }
+ata_sec_enabled() { ata_security_block "$1" | grep -qP '^\s+enabled'; }
+ata_sec_supported() { ata_security_block "$1" | grep -qP '^\s+supported$'; }
+ata_enhanced() { ata_security_block "$1" | grep -qP 'supported: enhanced erase'; }
+
+try_unfreeze() {
+  local dev=$1
+  ata_frozen "$dev" || return 0
+  if (( ! ALLOW_SUSPEND )); then info "drive is frozen and suspend is disabled"; return 1; fi
+  if [[ -e $STATE_DIR/suspended ]]; then info "drive still frozen after suspend/resume"; return 1; fi
+  info "drive is security-frozen by firmware; suspending for 6s to unfreeze..."
+  touch "$STATE_DIR/suspended"
+  if (( DRY_RUN )); then info "[dry-run] rtcwake -m mem -s 6"; return 0; fi
+  sync
+  rtcwake -m mem -s 6 >/dev/null 2>&1 || info "suspend failed (platform may only support s2idle)"
+  sleep 4
+  ata_frozen "$dev" && { info "still frozen after resume"; return 1; }
+  info "drive unfrozen"
+  return 0
+}
+
+ata_sanitize() {
+  local dev=$1 op=$2 out waited=0
+  run hdparm --yes-i-know-what-i-am-doing "$op" "$dev" || return 1
+  (( DRY_RUN )) && return 0
+  while :; do
+    out=$(hdparm --sanitize-status "$dev" 2>&1)
+    if grep -qiE 'in process|progress' <<<"$out"; then
+      info "$(grep -iE 'progress' <<<"$out" | head -n1 | xargs)"
+    elif grep -qi 'completed without error' <<<"$out"; then
+      info "sanitize completed"; return 0
+    elif grep -qiE 'failed|error' <<<"$out"; then
+      info "sanitize failed: $(xargs <<<"$out")"; return 1
+    else
+      (( waited > 30 )) && { info "sanitize status unclear: $(xargs <<<"$out")"; return 0; }
+    fi
+    sleep 5; waited=$(( waited + 5 ))
+    (( waited > 43200 )) && return 1
+  done
+}
+
+ata_security_erase() {
+  local dev=$1 mode rc
+  try_unfreeze "$dev" || return 1
+  if ata_locked "$dev"; then info "drive is ATA-password locked; cannot erase without its password"; return 1; fi
+  mode="--security-erase"
+  ata_enhanced "$dev" && mode="--security-erase-enhanced"
+  run hdparm --user-master u --security-set-pass "$ATA_PASS" "$dev" || return 1
+  run hdparm --user-master u "$mode" "$ATA_PASS" "$dev"; rc=$?
+  # Never leave a password on the drive, whatever happened above.
+  if (( ! DRY_RUN )) && ata_sec_enabled "$dev"; then
+    info "clearing temporary ATA password"
+    hdparm --user-master u --security-disable "$ATA_PASS" "$dev" >/dev/null 2>&1 ||
+      info "WARNING: could not clear ATA password. It is: $ATA_PASS"
+  fi
+  return "$rc"
+}
+
+# ----------------------------------------------------------- generic methods
+
+discard() { run blkdiscard -f "$1"; }
+secure_discard() { run blkdiscard -f -s "$1"; }
+
+zero_fill() {
+  local dev=$1 size mib rem lbs
+  size=$(size_bytes "$dev"); mib=$(( size / 1048576 )); rem=$(( size % 1048576 ))
+  lbs=$(blockdev --getss "$dev")
+  info "writing zeros over $(human "$size") — this can take hours on large HDDs"
+  run dd if=/dev/zero of="$dev" bs=1M count="$mib" oflag=direct status=progress || return 1
+  if (( rem > 0 )); then
+    run dd if=/dev/zero of="$dev" bs="$lbs" seek=$(( mib * 1048576 / lbs )) count=$(( rem / lbs )) oflag=direct || return 1
+  fi
+  run sync
+}
+
+# ---------------------------------------------------------------- canaries
+
+canary_offsets() {
+  local size=$1 i step last
+  last=$(( (size / CANARY_BS - 1) * CANARY_BS ))
+  step=$(( size / CANARY_COUNT / 1048576 * 1048576 ))
+  (( step < 1048576 )) && step=1048576
+  for (( i = 0; i < CANARY_COUNT - 1; i++ )); do
+    local o=$(( i * step + 1048576 ))
+    (( o > last )) && break
+    echo "$o"
+  done
+  echo "$last"
+}
+
+canary_plant() {
+  local dev=$1 dir=$2 off ok=0 total=0
+  head -c "$CANARY_BS" /dev/urandom > "$dir/canary.bin"
+  sha256sum < "$dir/canary.bin" | cut -d' ' -f1 > "$dir/canary.sha"
+  canary_offsets "$(size_bytes "$dev")" > "$dir/offsets"
+  if (( DRY_RUN )); then info "[dry-run] would plant $(wc -l < "$dir/offsets") canaries"; return 0; fi
+  while read -r off; do
+    total=$(( total + 1 ))
+    dd if="$dir/canary.bin" of="$dev" bs="$CANARY_BS" seek=$(( off / CANARY_BS )) count=1 \
+       oflag=direct,sync conv=notrunc status=none 2>/dev/null && ok=$(( ok + 1 ))
+  done < "$dir/offsets"
+  info "planted $ok/$total canaries"
+  (( ok == total ))
+}
+
+# Prints "erased/total" and succeeds only if every canary is gone and readable.
+canary_check() {
+  local dev=$1 dir=$2 off gone=0 total=0 unreadable=0 want got
+  want=$(cat "$dir/canary.sha")
+  blockdev --flushbufs "$dev" 2>/dev/null
+  while read -r off; do
+    total=$(( total + 1 ))
+    if dd if="$dev" of="$dir/read.bin" bs="$CANARY_BS" skip=$(( off / CANARY_BS )) count=1 \
+          iflag=direct status=none 2>/dev/null && [[ -s $dir/read.bin ]]; then
+      got=$(sha256sum < "$dir/read.bin" | cut -d' ' -f1)
+      [[ $got != "$want" ]] && gone=$(( gone + 1 ))
+    else
+      unreadable=$(( unreadable + 1 ))
+    fi
+  done < "$dir/offsets"
+  echo "$gone/$total"
+  (( unreadable > 0 )) && info "$unreadable canary locations unreadable (drive may be locked)"
+  (( gone == total && unreadable == 0 ))
+}
+
+# ---------------------------------------------------------------- teardown
+
+teardown() {
+  local dev=$1 name type mnt
+  # Unmount and deactivate anything stacked on the disk, deepest first.
+  while read -r name type mnt; do
+    [[ $name == "$dev" ]] && continue
+    if [[ $mnt == "[SWAP]" ]]; then run swapoff "$name"
+    elif [[ -n $mnt && $mnt != "-" ]]; then run umount -l "$name"
+    fi
+    case $type in
+      crypt|lvm|dm) run dmsetup remove --force "$name" ;;
+      raid*)        run mdadm --stop "$name" ;;
+    esac
+  done < <(lsblk -nrpo NAME,TYPE,MOUNTPOINT "$dev" 2>/dev/null | awk '{print $1, $2, ($3==""?"-":$3)}' | tac)
+  return 0
+}
+
+finalize() {
+  local dev=$1
+  run wipefs -a -f "$dev" >/dev/null
+  run sgdisk --zap-all "$dev" >/dev/null
+  run blockdev --rereadpt "$dev" 2>/dev/null
+  run partprobe "$dev" 2>/dev/null
+  return 0
+}
+
+# ---------------------------------------------------------- method ladders
+
+# Each ladder prints one method per line: "<id>|<description>".
+methods_for() {
+  local dev=$1 class ctrl sanicap fna
+  class=$(classify "$dev")
+  case $class in
+    nvme)
+      ctrl=$(nvme_ctrl "$dev")
+      sanicap=$(nvme_idctrl_field "$ctrl" sanicap)
+      fna=$(nvme_idctrl_field "$ctrl" fna)
+      (( sanicap & 1 )) && echo "nvme-sanitize-crypto|NVMe Sanitize (crypto erase)"
+      (( sanicap & 2 )) && echo "nvme-sanitize-block|NVMe Sanitize (block erase)"
+      (( fna & 4 ))     && echo "nvme-format-crypto|NVMe Format, crypto erase (SES=2)"
+      echo "nvme-format-user|NVMe Format, user data erase (SES=1)"
+      echo "discard|TRIM entire device"
+      echo "zero|Single zero pass"
+      ;;
+    sata-ssd|ssd-other)
+      ata_has "$dev" CRYPTO_SCRAMBLE_EXT && echo "ata-sanitize-crypto|ATA Sanitize (crypto scramble)"
+      ata_has "$dev" BLOCK_ERASE_EXT     && echo "ata-sanitize-block|ATA Sanitize (block erase)"
+      ata_sec_supported "$dev"           && echo "ata-secure-erase|ATA Security Erase$(ata_enhanced "$dev" && echo ' (enhanced)')"
+      echo "discard|TRIM entire device"
+      echo "zero|Single zero pass"
+      ;;
+    hdd)
+      echo "zero|Single zero pass (NIST 800-88 Clear)"
+      ;;
+    mmc)
+      echo "mmc-secure-discard|eMMC secure erase/trim"
+      echo "discard|TRIM entire device"
+      echo "zero|Single zero pass"
+      ;;
+  esac
+}
+
+apply_method() {
+  local dev=$1 m=$2
+  case $m in
+    nvme-sanitize-crypto) nvme_sanitize "$dev" 4 ;;
+    nvme-sanitize-block)  nvme_sanitize "$dev" 2 ;;
+    nvme-format-crypto)   nvme_format "$dev" 2 ;;
+    nvme-format-user)     nvme_format "$dev" 1 ;;
+    ata-sanitize-crypto)  ata_sanitize "$dev" --sanitize-crypto-scramble ;;
+    ata-sanitize-block)   ata_sanitize "$dev" --sanitize-block-erase ;;
+    ata-secure-erase)     ata_security_erase "$dev" ;;
+    mmc-secure-discard)   secure_discard "$dev" ;;
+    discard)              discard "$dev" ;;
+    zero)                 zero_fill "$dev" ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------- logging
+
+init_logs() {
+  mkdir -p "$STATE_DIR"
+  if [[ -z $LOG_DIR ]]; then
+    local part fstype
+    if part=$(blkid -L WIPELOGS 2>/dev/null); then
+      mkdir -p /mnt/wipelogs
+      mountpoint -q /mnt/wipelogs || mount "$part" /mnt/wipelogs 2>/dev/null
+      mountpoint -q /mnt/wipelogs && LOG_DIR=/mnt/wipelogs/wipelogs
+    fi
+    if [[ -z $LOG_DIR ]] && mountpoint -q /cdrom; then
+      fstype=$(findmnt -no FSTYPE /cdrom)
+      if [[ $fstype == vfat ]] && mount -o remount,rw /cdrom 2>/dev/null; then
+        LOG_DIR=/cdrom/wipelogs
+      fi
+    fi
+    [[ -z $LOG_DIR ]] && LOG_DIR=$STATE_DIR/logs
+  fi
+  mkdir -p "$LOG_DIR"
+  local host_serial
+  host_serial=$(dmidecode -s system-serial-number 2>/dev/null | head -n1 | tr -c 'A-Za-z0-9_\n-' '_' )
+  RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)_${host_serial:-unknown}"
+  RUN_LOG="$LOG_DIR/$RUN_ID.log"
+  REPORT="$LOG_DIR/$RUN_ID.jsonl"
+  {
+    echo "wipestick $VERSION  run $RUN_ID"
+    echo "system: $(dmidecode -s system-manufacturer 2>/dev/null | head -n1) $(dmidecode -s system-product-name 2>/dev/null | head -n1) serial=$host_serial"
+    echo "kernel: $(uname -r)  dry_run=$DRY_RUN"
+  } >> "$RUN_LOG"
+  [[ $LOG_DIR == "$STATE_DIR"/* ]] && log "NOTE: logs are in RAM ($LOG_DIR) and will be lost at reboot"
+  echo "$LOG_DIR" > "$STATE_DIR/log_dir"
+}
+
+report() {
+  # report dev class method result canaries notes
+  jq -cn --arg time "$(ts)" --arg run "$RUN_ID" --arg dev "$1" --arg class "$2" \
+    --arg model "$(lsblk -dno MODEL "$1" 2>/dev/null | xargs)" \
+    --arg serial "$(lsblk -dno SERIAL "$1" 2>/dev/null | xargs)" \
+    --arg size "$(size_bytes "$1" 2>/dev/null)" \
+    --arg host_model "$(dmidecode -s system-product-name 2>/dev/null | head -n1)" \
+    --arg host_serial "$(dmidecode -s system-serial-number 2>/dev/null | head -n1)" \
+    --arg method "$3" --arg result "$4" --arg canaries "$5" --arg notes "$6" --argjson dry "$DRY_RUN" \
+    '{time:$time,run:$run,host_model:$host_model,host_serial:$host_serial,device:$dev,class:$class,model:$model,serial:$serial,size_bytes:($size|tonumber? // null),method:$method,result:$result,canaries_erased:$canaries,notes:$notes,dry_run:($dry==1)}' \
+    >> "$REPORT"
+  echo "$(devname "$1")|$4|$3|$5|$6" >> "$STATE_DIR/summary"
+}
+
+# --------------------------------------------------------------- commands
+
+cmd_plan() {
+  local dev m n=0
+  for dev in "$@"; do
+    echo "$dev  [$(classify "$dev")]  $(human "$(size_bytes "$dev")")  $(lsblk -dno MODEL "$dev" | xargs)"
+    if [[ $(classify "$dev") == nvme ]] && (( $(nvme_ns_count "$(nvme_ctrl "$dev")") > 1 )); then
+      echo "    NOTE: controller has multiple namespaces; sanitize erases all of them"
+    fi
+    n=0
+    while IFS='|' read -r m desc; do
+      n=$(( n + 1 )); echo "    $n. $desc"
+    done < <(methods_for "$dev")
+  done
+}
+
+erase_one() {
+  local dev=$1 class dir m desc result="FAILED" used="none" canaries="-" notes=""
+  class=$(classify "$dev")
+  dir=$(mktemp -d "$STATE_DIR/$(devname "$dev").XXXX")
+  log "=== $dev  [$class]  $(human "$(size_bytes "$dev")")  $(lsblk -dno MODEL,SERIAL "$dev" | xargs)"
+
+  teardown "$dev"
+  local planted=1
+  canary_plant "$dev" "$dir" || { planted=0; notes="canary write failed (drive may be locked: SED/Opal or ATA password)"; info "$notes"; }
+
+  while IFS='|' read -r m desc; do
+    log "--- trying: $desc"
+    if ! apply_method "$dev" "$m"; then
+      info "method failed: $desc"
+      continue
+    fi
+    if (( DRY_RUN )); then used=$m; result="DRY-RUN"; break; fi
+    if canaries=$(canary_check "$dev" "$dir"); then
+      info "verified: $canaries canaries erased"
+      used=$m; result="OK"; break
+    fi
+    info "verification failed after $desc (canaries erased: $canaries); trying next method"
+  done < <(methods_for "$dev")
+
+  if [[ $result == OK || $result == DRY-RUN ]]; then
+    finalize "$dev"
+    (( planted )) || notes="verified by readback only; ${notes}"
+  elif [[ -n $notes ]]; then
+    notes="$notes. If this is a self-encrypting drive, run a PSID revert using the PSID printed on its label."
+  fi
+  log "=== $dev: $result via $used"
+  report "$dev" "$class" "$used" "$result" "$canaries" "$notes"
+  rm -rf "$dir"
+  [[ $result == OK || $result == DRY-RUN ]]
+}
+
+cmd_erase() {
+  local confirm="" dev fails=0 eligible
+  [[ ${1:-} == --confirm ]] || die "erase requires --confirm ERASE"
+  confirm=${2:-}; shift 2
+  [[ $confirm == ERASE ]] || die "confirmation token must be ERASE"
+  (( $# > 0 )) || die "no devices given"
+  eligible=$(eligible_drives)
+  for dev in "$@"; do
+    [[ -b $dev ]] || die "$dev is not a block device"
+    is_protected "$dev" && die "$dev is the boot/log medium; refusing"
+    grep -qx "$dev" <<<"$eligible" || die "$dev is not an eligible drive (see 'wipestick list')"
+  done
+  init_logs
+  : > "$STATE_DIR/summary"
+  rm -f "$STATE_DIR/suspended"
+  local w; while read -r w; do [[ -n $w ]] && log "WARNING: $w"; done < <(platform_warnings)
+  for dev in "$@"; do erase_one "$dev" || fails=$(( fails + 1 )); done
+  sync
+  log "done: $(( $# - fails ))/$# drives erased. Log: $RUN_LOG"
+  (( fails == 0 ))
+}
+
+main() {
+  while [[ ${1:-} == --* ]]; do
+    case $1 in
+      --dry-run)    DRY_RUN=1 ;;
+      --allow-usb)  ALLOW_USB=1 ;;
+      --no-suspend) ALLOW_SUSPEND=0 ;;
+      --log-dir)    LOG_DIR=$2; shift ;;
+      --version)    echo "wipestick $VERSION"; exit 0 ;;
+      --help)       sed -n '2,25p' "$0"; exit 0 ;;
+      *) die "unknown option $1" ;;
+    esac
+    shift
+  done
+  need_root
+  mkdir -p "$STATE_DIR"
+  case ${1:-} in
+    list)     cmd_list ;;
+    warnings) platform_warnings ;;
+    plan)     shift; cmd_plan "$@" ;;
+    erase)    shift; cmd_erase "$@" ;;
+    *) die "usage: wipestick [--dry-run] [--allow-usb] {list|plan|erase --confirm ERASE} [dev...]" ;;
+  esac
+}
+
+main "$@"
