@@ -104,7 +104,9 @@ Tested in QEMU (no real hardware yet):
 
 \* An Ubuntu build using Debian's live-boot (`LIVEBOOT=1 build/build-ubuntu.sh`). It exercises the same boot and medium-mount path as the Debian image, which could not be built where this was developed.
 
-**Not yet tested on real drives:** NVMe Sanitize, NVMe crypto Format, ATA Sanitize, ATA Security Erase, and the suspend-to-unfreeze step. QEMU does not emulate these. Test them on a few spare machines before relying on the tool, and start with `--dry-run` from the root shell.
+**First real-hardware run (Dell OptiPlex 3030 AIO, SanDisk X300 128 GB SATA SSD, v0.1.0):** ATA Sanitize was rejected by the drive (hdparm still reported it as started; the canaries caught it). The firmware had the drive frozen; suspend/resume unfroze it, and ATA Security Erase (enhanced) completed and verified 16/16 in about 9 minutes. The display did not come back after resume (expected with `nomodeset`); v0.1.1 warns about this and powers off automatically.
+
+**Not yet tested on real drives:** NVMe Sanitize, NVMe crypto Format, and a successful ATA Sanitize. QEMU does not emulate these. Test them on a few spare machines before relying on the tool, and start with `--dry-run` from the root shell.
 
 ## Roadmap ideas
 

@@ -83,7 +83,16 @@ Type ERASE (capitals) to continue, or Cancel to go back." "$H" "$W" 3>&1 1>&2 2>
   local rc=$? logdir summary
   logdir=$(cat /run/wipestick/log_dir 2>/dev/null)
   summary=$(awk -F'|' '{printf "%-10s %-7s %-22s canaries %s\n%s", $1, $2, $3, $4, ($5==""?"":"    "$5"\n")}' /run/wipestick/summary 2>/dev/null)
-  echo; read -rp "Press Enter for the summary..." _
+  echo
+  # If the engine suspended the machine to unfreeze a drive, the display often
+  # does not come back (no GPU driver with nomodeset). Power off on our own.
+  if [[ -e /run/wipestick/suspended ]]; then
+    echo "The machine was suspended to unfreeze a drive, so the screen may be dark."
+    echo "Powering off in 60 seconds. Press Enter to see the summary instead."
+    if ! read -rt 60 _; then sync; systemctl poweroff 2>/dev/null || poweroff -f; fi
+  else
+    read -rp "Press Enter for the summary..." _
+  fi
   if (( rc == 0 )); then
     msg "All selected drives erased and verified. Partition tables are cleared, so the machine is ready for an OS install.
 

@@ -24,7 +24,7 @@
 
 set -uo pipefail
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 DRY_RUN=0
 ALLOW_USB=0
 ALLOW_SUSPEND=1
@@ -99,7 +99,8 @@ classify() {
 
 size_bytes() { blockdev --getsize64 "$1"; }
 
-human() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1"; }
+# Decimal units, rounded to nearest, so sizes match drive labels (128GB, not 120GB).
+human() { numfmt --to=si --round=nearest --suffix=B "$1" 2>/dev/null || echo "$1"; }
 
 # ------------------------------------------------------------- enumeration
 
@@ -217,6 +218,9 @@ try_unfreeze() {
   if (( ! ALLOW_SUSPEND )); then info "drive is frozen and suspend is disabled"; return 1; fi
   if [[ -e $STATE_DIR/suspended ]]; then info "drive still frozen after suspend/resume"; return 1; fi
   info "drive is security-frozen by firmware; suspending for 6s to unfreeze..."
+  info "NOTE: the screen may stay dark after this. The erase continues, and the"
+  info "machine powers off by itself about a minute after it finishes."
+  sleep 5   # give the operator time to read the note
   touch "$STATE_DIR/suspended"
   if (( DRY_RUN )); then info "[dry-run] rtcwake -m mem -s 6"; return 0; fi
   sync
@@ -228,14 +232,24 @@ try_unfreeze() {
 }
 
 ata_sanitize() {
-  local dev=$1 op=$2 out waited=0
-  run hdparm --yes-i-know-what-i-am-doing "$op" "$dev" || return 1
-  (( DRY_RUN )) && return 0
+  local dev=$1 op=$2 out rc waited=0 seen_busy=0
+  if (( DRY_RUN )); then info "[dry-run] hdparm --yes-i-know-what-i-am-doing $op $dev"; return 0; fi
+  info "+ hdparm --yes-i-know-what-i-am-doing $op $dev"
+  out=$(hdparm --yes-i-know-what-i-am-doing "$op" "$dev" 2>&1); rc=$?
+  printf '%s\n' "$out" | tee -a "$RUN_LOG" >&2
+  # hdparm can report "Operation started" even when the drive aborted the
+  # command; the abort only shows up as SG_IO sense data. Treat it as failure.
+  if (( rc != 0 )) || grep -qiE 'SG_IO|sense data|aborted' <<<"$out"; then
+    info "drive rejected the sanitize command"
+    return 1
+  fi
   while :; do
     out=$(hdparm --sanitize-status "$dev" 2>&1)
     if grep -qiE 'in process|progress' <<<"$out"; then
+      seen_busy=1
       info "$(grep -iE 'progress' <<<"$out" | head -n1 | xargs)"
     elif grep -qi 'completed without error' <<<"$out"; then
+      (( seen_busy )) || info "sanitize reported complete without a visible in-progress state (verification will confirm)"
       info "sanitize completed"; return 0
     elif grep -qiE 'failed|error' <<<"$out"; then
       info "sanitize failed: $(xargs <<<"$out")"; return 1
@@ -255,11 +269,21 @@ ata_security_erase() {
   ata_enhanced "$dev" && mode="--security-erase-enhanced"
   run hdparm --user-master u --security-set-pass "$ATA_PASS" "$dev" || return 1
   run hdparm --user-master u "$mode" "$ATA_PASS" "$dev"; rc=$?
-  # Never leave a password on the drive, whatever happened above.
-  if (( ! DRY_RUN )) && ata_sec_enabled "$dev"; then
-    info "clearing temporary ATA password"
-    hdparm --user-master u --security-disable "$ATA_PASS" "$dev" >/dev/null 2>&1 ||
-      info "WARNING: could not clear ATA password. It is: $ATA_PASS"
+  # Never leave a password on the drive, whatever happened above, and say so
+  # explicitly in the log so the erase report shows the drive is unlocked.
+  if (( ! DRY_RUN )); then
+    if ata_sec_enabled "$dev"; then
+      info "clearing temporary ATA password"
+      hdparm --user-master u --security-disable "$ATA_PASS" "$dev" >/dev/null 2>&1
+    fi
+    if ata_sec_enabled "$dev"; then
+      info "WARNING: ATA password is still set on $dev. It is: $ATA_PASS"
+      info "Unlock with: hdparm --user-master u --security-disable $ATA_PASS $dev"
+      touch "$STATE_DIR/pwstuck.$(devname "$dev")"
+      rc=1
+    else
+      info "ATA security: no password set (drive unlocked)"
+    fi
   fi
   return "$rc"
 }
@@ -485,6 +509,7 @@ erase_one() {
   dir=$(mktemp -d "$STATE_DIR/$(devname "$dev").XXXX")
   log "=== $dev  [$class]  $(human "$(size_bytes "$dev")")  $(lsblk -dno MODEL,SERIAL "$dev" | xargs)"
 
+  rm -f "$STATE_DIR/pwstuck.$(devname "$dev")"
   teardown "$dev"
   local planted=1
   canary_plant "$dev" "$dir" || { planted=0; notes="canary write failed (drive may be locked: SED/Opal or ATA password)"; info "$notes"; }
@@ -493,6 +518,12 @@ erase_one() {
     log "--- trying: $desc"
     if ! apply_method "$dev" "$m"; then
       info "method failed: $desc"
+      # A drive left with an ATA password locks itself at next power-on.
+      # Never report such a drive as OK, whatever later methods achieve.
+      if [[ -e $STATE_DIR/pwstuck.$(devname "$dev") ]]; then
+        notes="ATA password '$ATA_PASS' is still set; the drive will be locked at next power-on. Unlock from the root shell: hdparm --user-master u --security-disable $ATA_PASS $dev"
+        break
+      fi
       continue
     fi
     if (( DRY_RUN )); then used=$m; result="DRY-RUN"; break; fi
@@ -506,7 +537,7 @@ erase_one() {
   if [[ $result == OK || $result == DRY-RUN ]]; then
     finalize "$dev"
     (( planted )) || notes="verified by readback only; ${notes}"
-  elif [[ -n $notes ]]; then
+  elif [[ $notes == "canary write failed"* ]]; then
     notes="$notes. If this is a self-encrypting drive, run a PSID revert using the PSID printed on its label."
   fi
   log "=== $dev: $result via $used"
