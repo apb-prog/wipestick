@@ -125,7 +125,11 @@ Tested in QEMU:
 
 **Third real-hardware run (same OptiPlex 3030 AIO and SanDisk X300, v0.1.4, legacy BIOS boot):** this time the drive accepted ATA Sanitize (block erase), but its progress counter sat at 0x5b (0%) for over 7 minutes until the operator stopped it. The partitions were still readable after a reboot, so nothing had been erased. v0.1.5 adds stall detection, skips a stalled method on later runs, and handles Ctrl+C with a summary screen. The stall, skip and interrupt paths were tested against a simulated drive replaying this one's responses; the fix has not been run on the machine yet.
 
-**Not yet tested on real drives:** NVMe Sanitize, NVMe crypto Format, and a successful ATA Sanitize. QEMU does not emulate these. Test them on a few spare machines before relying on the tool, and start with `--dry-run` from the root shell.
+**Fourth real-hardware run (same OptiPlex and SanDisk X300, v0.1.5):** ATA Sanitize (block erase) completed in about 9 seconds and verified 16/16 (Purge). Same drive and command as the stalled run, so the stall looks intermittent; its cause is unknown.
+
+**ThinkPad X1 Carbon, v0.1.5:** NVMe Format SES=2 and SES=1 were again rejected with Command Sequence Error; the zero pass started and was stopped with Ctrl+C, which recorded the drive as INTERRUPTED. The log's TCG line ("locking unsupported, disabled, LOCKED") was wrong: Debian 13's nvme-cli prints a status line before the raw Level 0 bytes, which shifted the parser. v0.1.6 strips it. Decoded correctly, the drive reports Opal 2 with locking supported but disabled and unlocked, and Block SID not set, so TCG is not what blocks Format.
+
+**Not yet tested on real drives:** NVMe Sanitize and NVMe crypto Format. QEMU does not emulate these. Test them on a few spare machines before relying on the tool, and start with `--dry-run` from the root shell.
 
 ## Roadmap ideas
 

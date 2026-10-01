@@ -19,6 +19,7 @@ jobs:
           shellcheck -S warning src/wipestick src/wipestick-tui
           overlay/usr/local/sbin/wipestick-selftest build/*.sh tests/*.sh
           live/auto/* live/config/hooks/normal/*.chroot live/config/hooks/normal/*.binary
+      - run: tests/tcg-parse.sh
 
   build:
     needs: lint

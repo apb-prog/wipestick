@@ -25,7 +25,7 @@
 
 set -uo pipefail
 
-VERSION="0.1.5"
+VERSION="0.1.6"
 DRY_RUN=0
 ALLOW_USB=0
 ALLOW_SUSPEND=1
@@ -252,11 +252,17 @@ tcg_level0() {
   if ! nvme security-recv "$ctrl" -p 1 -s 1 -x 2048 -t 2048 -b > "$f" 2>/dev/null || [[ ! -s $f ]]; then
     rm -f "$f"; echo "TCG: no response (not a self-encrypting drive, or not supported)"; return 1
   fi
+  # Some nvme-cli versions (Debian 13's included) print a status line before
+  # the raw bytes even with -b. Drop it, or every offset below is shifted.
+  if [[ $(head -c 4 "$f" | tr -d '\0') == NVME ]]; then
+    tail -c +$(( $(head -n1 "$f" | wc -c) + 1 )) "$f" > "$f.raw" && mv "$f.raw" "$f"
+  fi
   local -a B
   mapfile -t B < <(od -An -tu1 -v "$f" | tr -s ' ' '\n' | grep -v '^$')
   rm -f "$f"
   (( ${#B[@]} >= 48 )) || { echo "TCG: short response"; return 1; }
   len=$(( (B[0] << 24) | (B[1] << 16) | (B[2] << 8) | B[3] ))
+  (( len >= 44 && len <= 65536 )) || { echo "TCG: unreadable response (header length $len)"; return 1; }
   end=$(( len + 4 )); (( end > ${#B[@]} )) && end=${#B[@]}
   i=48
   while (( i + 4 <= end )); do
