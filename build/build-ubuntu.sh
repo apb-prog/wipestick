@@ -112,7 +112,7 @@ du -sx --block-size=1 "$CHROOT" | cut -f1 > "$IMAGE/$LIVEDIR/filesystem.size"
 echo "==> [6/7] bootloaders"
 echo "wipestick $(sed -n 's/^VERSION="\(.*\)"/\1/p' "$ROOT/src/wipestick") ($SUITE amd64) $(date -u +%Y%m%d)" > "$IMAGE/.disk/info"
 GFX="module_blacklist=amdgpu,radeon,nouveau,xe"
-CMDLINE="$BOOTARG quiet loglevel=3 fsck.mode=skip systemd.show_status=0"
+CMDLINE="$BOOTARG quiet loglevel=3 fsck.mode=skip systemd.show_status=0 systemd.log_level=crit"
 cat > "$IMAGE/boot/grub/grub.cfg" <<EOF
 set timeout=5
 set default=0

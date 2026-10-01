@@ -4,13 +4,27 @@
 
 set -uo pipefail
 ENGINE=${WIPESTICK_ENGINE:-/usr/local/sbin/wipestick}
-TITLE="wipestick"
+TITLE="WipeStick"
 export WIPESTICK_ACTIVE=1
 export NEWT_COLORS='root=,red window=,black border=white,black textbox=white,black button=black,white title=white,black checkbox=white,black actcheckbox=black,white entry=white,black'
 
 dims() { H=$(( $(tput lines) - 4 )); W=$(( $(tput cols) - 8 )); (( W > 100 )) && W=100; }
 
-msg()   { dims; whiptail --title "$TITLE" --msgbox "$1" "$H" "$W"; }
+OK_BTN="Press Enter to Continue"
+CANCEL_BTN="Press Esc to Cancel"
+# Message box sized to its text. No --scrolltext: with it, whiptail ignores
+# Enter until Tab moves focus to the button, which confuses operators.
+msg() {
+  local text=$1 btn=${2:-$OK_BTN} line need=7 inner
+  dims
+  inner=$(( W - 4 ))
+  while IFS= read -r line; do
+    need=$(( need + (${#line} + inner - 1) / inner ))
+    (( ${#line} == 0 )) && need=$(( need + 1 ))
+  done <<<"$text"
+  (( need > H )) && need=$H
+  whiptail --title "$TITLE" --ok-button "$btn" --msgbox "$text" "$need" "$W"
+}
 yesno() { dims; whiptail --title "$TITLE" --yes-button "$2" --no-button "$3" --yesno "$1" "$H" "$W"; }
 
 sysinfo() {
@@ -19,19 +33,35 @@ sysinfo() {
     "$(dmidecode -s system-serial-number 2>/dev/null | head -n1)"
 }
 
+# Power off or reboot with a clean screen: silence the kernel console and
+# systemd's shutdown status lines (the live medium cannot be unmounted while
+# the system runs from it, which otherwise prints harmless "Failed unmounting"
+# messages).
+shutdown_quietly() {
+  local action=$1
+  sync
+  dmesg -n 1 2>/dev/null
+  mount -o remount,ro /run/live/medium 2>/dev/null || mount -o remount,ro /cdrom 2>/dev/null || true
+  clear
+  if [[ $action == reboot ]]; then echo "WipeStick: rebooting..."; else echo "WipeStick: powering off..."; fi
+  setterm --cursor off 2>/dev/null
+  systemctl "$action" 2>/dev/null || "$action" -f
+  sleep 30
+}
+
 end_menu() {
   local choice
   dims
-  choice=$(whiptail --title "$TITLE" --nocancel --menu "What next?" 15 64 5 \
+  choice=$(whiptail --title "$TITLE" --nocancel --notags --ok-button "$OK_BTN" --menu "What next?" 15 64 5 \
     poweroff "Power off" \
-    reboot   "Reboot (remove the USB first to boot the installer)" \
+    reboot   "Reboot" \
     again    "Start over" \
     diag     "Save diagnostics to the USB stick" \
     shell    "Drop to a root shell" 3>&1 1>&2 2>&3) || choice=again
   case $choice in
-    poweroff) sync; systemctl poweroff 2>/dev/null || poweroff -f ;;
-    reboot)   sync; systemctl reboot 2>/dev/null || reboot -f ;;
-    shell)    clear; echo "Type 'exit' to return to wipestick."; bash -l ;;
+    poweroff) shutdown_quietly poweroff ;;
+    reboot)   shutdown_quietly reboot ;;
+    shell)    clear; echo "Type 'exit' to return to WipeStick."; bash -l ;;
     diag)     msg "Diagnostics saved to:
 $("$ENGINE" diag 2>&1 | tail -n1)
 
@@ -60,28 +90,41 @@ ${warnings:-If this machine has a drive, check firmware setup: set the storage/S
   done <<<"$list"
 
   dims
-  selected=$(whiptail --title "$TITLE - select drives to ERASE" --separate-output \
+  # List height: one row per drive (plus one), but always leave room for the
+  # instructions above it.
+  local lh=$(( ${#items[@]} / 3 + 1 )) max_lh=$(( H - 16 ))
+  (( max_lh < 3 )) && max_lh=3
+  (( lh > max_lh )) && lh=$max_lh
+  selected=$(whiptail --title "$TITLE" --separate-output \
+    --ok-button "$OK_BTN" --cancel-button "$CANCEL_BTN" \
     --checklist "$(sysinfo)
 ${warnings:+
 WARNING: $warnings
 }
-Space toggles, Enter continues. The USB stick itself is never listed." \
-    "$H" "$W" $(( H - 10 )) "${items[@]}" 3>&1 1>&2 2>&3) || { end_menu; return; }
+Select drives to Erase.
+Press Space to toggle, Enter to continue or Esc to cancel.
+The USB stick itself is not listed." \
+    "$H" "$W" "$lh" "${items[@]}" 3>&1 1>&2 2>&3) || { end_menu; return; }
   [[ -z $selected ]] && { msg "Nothing selected."; return; }
 
   # shellcheck disable=SC2086
   plan=$("$ENGINE" plan $selected 2>&1)
   dims
-  typed=$(whiptail --title "$TITLE - CONFIRM" --inputbox "ALL DATA on these drives will be permanently destroyed.
-Methods are tried in order until one is verified:
+  typed=$(whiptail --title "$TITLE - CONFIRM" --ok-button "$OK_BTN" --cancel-button "$CANCEL_BTN" \
+    --inputbox "ALL DATA on listed drives will be permanently destroyed.
+Each method is tried in order until one is verified:
 
 $plan
 
-Type ERASE (capitals) to continue, or Cancel to go back." "$H" "$W" 3>&1 1>&2 2>&3) || return
-  if [[ $typed != ERASE ]]; then msg "Confirmation did not match. Nothing was erased."; return; fi
+Type ERASE (ALL CAPS) and press Enter to continue, or Esc to cancel and return to drive selection menu." "$H" "$W" 3>&1 1>&2 2>&3) || return
+  if [[ $typed != ERASE ]]; then
+    msg "Confirmation text did not match. No drives have been wiped.
+Press Enter or Esc to return to drive selection menu." "Press Enter to Return"
+    return
+  fi
 
   clear
-  echo "wipestick: erasing - do not power off or remove the USB stick."
+  echo "WipeStick: erasing - do not power off or remove the USB stick."
   echo
   # shellcheck disable=SC2086
   "$ENGINE" erase --confirm ERASE $selected
@@ -95,22 +138,28 @@ Type ERASE (capitals) to continue, or Cancel to go back." "$H" "$W" 3>&1 1>&2 2>
   if [[ -e /run/wipestick/suspended ]] && ! "$ENGINE" display >/dev/null 2>&1; then
     echo "The machine was suspended to unfreeze a drive, so the screen may be dark."
     echo "Powering off in 60 seconds. Press Enter to see the summary instead."
-    if ! read -rt 60 _; then sync; systemctl poweroff 2>/dev/null || poweroff -f; fi
+    if ! read -rt 60 _; then shutdown_quietly poweroff; fi
   else
     read -rp "Press Enter for the summary..." _
   fi
   if (( rc == 0 )); then
-    msg "All selected drives erased and verified. Partition tables are cleared, so the machine is ready for an OS install.
+    msg "Operation successful.
+All selected drives were erased and verified. All data and partition tables have been cleared.
 
 $summary
+
 $legend
-Log: $logdir"
+Log: $logdir
+
+Press Enter to continue." "Press Enter to Continue"
   else
     msg "One or more drives FAILED.
 
 $summary
 Common fixes: set storage mode to AHCI; for self-encrypting drives, do a PSID revert; for frozen SATA drives, hot-plug the drive or try another port.
-Log: $logdir"
+Log: $logdir
+
+Press Enter to continue." "Press Enter to Continue"
   fi
   end_menu
 }

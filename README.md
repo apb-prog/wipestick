@@ -47,10 +47,15 @@ sudo ./build/make-usb.sh wipestick-debian.iso /dev/sdX
 
 Both images boot the default entry after 5 seconds.
 
-- **Default entry:** loads Intel's graphics driver (i915), which gives native resolution and restores the display after the suspend used to unfreeze SATA drives. The AMD, NVIDIA and newer Intel `xe` drivers are blocked (`module_blacklist=amdgpu,radeon,nouveau,xe`), because without non-free firmware they can leave the screen black. Those machines use the basic firmware display instead. It works, but stays dark after a suspend; the tool then powers off by itself 60 seconds after finishing.
-- **Fail-safe / safe graphics entry:** `nomodeset` for everything. Use it if the screen goes black at boot.
+- **WipeStick (default):** loads Intel's graphics driver (i915), which gives native resolution and restores the display after the suspend used to unfreeze SATA drives. The AMD, NVIDIA and newer Intel `xe` drivers are blocked (`module_blacklist=amdgpu,radeon,nouveau,xe`), because without non-free firmware they can leave the screen black. Those machines use the basic firmware display instead. It works, but stays dark after a suspend, so only then does WipeStick warn about it and power off by itself 60 seconds after finishing.
+- **WipeStick (safe graphics):** `nomodeset` for everything. Use it if the screen goes black at boot.
 - The console font is picked at startup: the largest Terminus font that still gives at least 100x30 characters.
 - To run from RAM on the Debian image, press `e` (GRUB) or `Tab` (syslinux) and add `toram`. The Ubuntu image has it as a menu entry.
+- Boot and shutdown are kept quiet (`quiet loglevel=3 systemd.show_status=false systemd.log_level=crit`), so the harmless "Failed unmounting" messages from the live medium at power-off are not shown. The trade-off: systemd's own error messages are not logged either.
+
+### Branding
+
+`live/branding/splash.png` (1920x1080) is the GRUB/UEFI background, and `splash-bios.png` (640x480) is the syslinux/BIOS one, with the logo kept above the menu rows. The build hook `live/config/hooks/normal/9200-branding.hook.binary` installs them, asks GRUB for 1920x1080 (falling back to the panel's own mode), and renames the menu entries. Custom GRUB fonts are not used: signed GRUB refuses to load font files under Secure Boot, so the menu uses GRUB's built-in 16-pixel font.
 
 ## Known limits and fixes
 

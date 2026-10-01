@@ -28,6 +28,6 @@ lb config noauto \
   --iso-volume "WIPESTICK" \
   --iso-application "wipestick" \
   --iso-publisher "wipestick project" \
-  --bootappend-live "boot=live components quiet loglevel=3 noeject live-config.hostname=wipestick module_blacklist=amdgpu,radeon,nouveau,xe" \
-  --bootappend-live-failsafe "boot=live components quiet loglevel=3 noeject live-config.hostname=wipestick nomodeset" \
+  --bootappend-live "boot=live components quiet loglevel=3 noeject live-config.hostname=wipestick systemd.show_status=false systemd.log_level=crit module_blacklist=amdgpu,radeon,nouveau,xe" \
+  --bootappend-live-failsafe "boot=live components quiet loglevel=3 noeject live-config.hostname=wipestick systemd.show_status=false systemd.log_level=crit nomodeset" \
   "${@}"

@@ -1,0 +1,33 @@
+#!/bin/sh
+# Apply WipeStick branding to the boot menus: GRUB (UEFI) and syslinux (BIOS).
+# Images live in live/branding/ in the repo: splash.png (1920x1080, GRUB/UEFI)
+# and splash-bios.png (640x480, syslinux/BIOS; logo kept above the menu rows).
+set -e
+[ -d binary/boot ] && cd binary   # run from either the build root or binary/
+
+SRC=""
+for d in ../branding branding ../../live/branding; do
+  [ -f "$d/splash.png" ] && { SRC=$d; break; }
+done
+[ -n "$SRC" ] || { echo "branding: live/branding/splash.png not found; keeping defaults"; exit 0; }
+
+# Fonts: signed GRUB refuses to load font files from disk under Secure Boot
+# ("prohibited by secure boot policy"), so the menu keeps GRUB's built-in
+# Unifont 16 and only spacing is adjusted.
+
+# ---- GRUB (UEFI): 1920x1080 when the firmware offers it, else native/auto.
+if [ -f boot/grub/config.cfg ]; then
+  cp "$SRC/splash.png" boot/grub/splash.png
+  sed -i 's/set gfxmode=800x600/set gfxmode=1920x1080,auto/' boot/grub/config.cfg
+  T=boot/grub/live-theme/theme.txt
+  sed -i 's/item_height = 16/item_height = 24/; s/item_spacing = 4/item_spacing = 8/' "$T"
+  sed -i 's/menuentry "Live system (amd64)"/menuentry "WipeStick"/; s/menuentry "Live system (amd64 fail-safe mode)"/menuentry "WipeStick (safe graphics)"/' boot/grub/grub.cfg
+fi
+
+# ---- syslinux (legacy BIOS): 640x480 splash with the logo above the menu.
+if [ -f isolinux/live.cfg ]; then
+  [ -f "$SRC/splash-bios.png" ] && cp "$SRC/splash-bios.png" isolinux/splash.png
+  sed -i 's/menu label ^Live system (amd64)$/menu label ^WipeStick/; s/menu label Live system (amd64 fail-safe mode)/menu label WipeStick (safe graphics)/' isolinux/live.cfg
+  sed -i 's/^menu title Boot menu/menu title WipeStick/' isolinux/menu.cfg
+fi
+echo "branding: applied from $SRC"
