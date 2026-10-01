@@ -21,6 +21,19 @@ if [ -f boot/grub/config.cfg ]; then
   sed -i 's/set gfxmode=800x600/set gfxmode=1920x1080,auto/' boot/grub/config.cfg
   T=boot/grub/live-theme/theme.txt
   sed -i 's/item_height = 16/item_height = 24/; s/item_spacing = 4/item_spacing = 8/' "$T"
+  # Centre the menu under the logo (the stock theme starts it at 10% from the left).
+  sed -i 's/left = 10%/left = 50%-200/; s/width = 80%/width = 400/' "$T"
+  # When an entry starts, GRUB draws its text window as a black box, by default
+  # over the logo. Pin it to the bottom of the screen, which is plain black in
+  # the splash. 416 px = 26 rows: GRUB grows a shorter window upward again.
+  cat >> "$T" <<'THEME'
+
+terminal-left: "0"
+terminal-top: "100%-416"
+terminal-width: "100%"
+terminal-height: "416"
+terminal-border: "0"
+THEME
   sed -i 's/menuentry "Live system (amd64)"/menuentry "WipeStick"/; s/menuentry "Live system (amd64 fail-safe mode)"/menuentry "WipeStick (safe graphics)"/' boot/grub/grub.cfg
 fi
 

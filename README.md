@@ -58,7 +58,7 @@ Both images boot the default entry after 5 seconds.
 
 ### Branding
 
-`live/branding/splash.png` (1920x1080) is the GRUB/UEFI background, and `splash-bios.png` (640x480) is the syslinux/BIOS one, with the logo kept above the menu rows. The build hook `live/config/hooks/normal/9200-branding.hook.binary` installs them, asks GRUB for 1920x1080 (falling back to the panel's own mode), and renames the menu entries. Custom GRUB fonts are not used: signed GRUB refuses to load font files under Secure Boot, so the menu uses GRUB's built-in 16-pixel font.
+`live/branding/splash.png` (1920x1080) is the GRUB/UEFI background, and `splash-bios.png` (640x480) is the syslinux/BIOS one, with the logo kept above the menu rows. The build hook `live/config/hooks/normal/9200-branding.hook.binary` installs them, asks GRUB for 1920x1080 (falling back to the panel's own mode), renames the menu entries, centres the GRUB menu under the logo, and pins GRUB's text window to the bottom of the screen (otherwise it draws a black box over the logo when an entry starts). Custom GRUB fonts are not used: signed GRUB refuses to load font files under Secure Boot, so the menu uses GRUB's built-in 16-pixel font.
 
 ## Known limits and fixes
 
