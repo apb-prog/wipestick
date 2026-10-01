@@ -17,8 +17,10 @@ if grep -q 'WSBOOT' <<<"$list"; then echo "FAIL: boot disk is listed as erasable
 
 # Suspend/resume check: the SATA unfreeze path suspends real machines, so make
 # sure the live system (boot medium, services, display driver) survives it.
-drm=$(basename "$(readlink -f /sys/class/drm/card0/device/driver 2>/dev/null)" 2>/dev/null)
-echo "display driver: ${drm:-none (firmware framebuffer)}"
+echo "display driver: $(wipestick display)"
+# The default boot entry must have a real graphics driver (bochs-drm in QEMU),
+# otherwise the screen would not come back after the SATA unfreeze suspend.
+wipestick display >/dev/null || { echo "FAIL: no graphics driver loaded"; fail=1; }
 # Opt-in via a second OEM string: QEMU's UEFI firmware (OVMF) hangs on S3
 # resume under emulation, so the harness only requests this for BIOS boots.
 if dmidecode -t 11 2>/dev/null | grep -q wipestick-selftest-s3 && grep -qw mem /sys/power/state 2>/dev/null; then
