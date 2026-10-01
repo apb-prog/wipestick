@@ -44,7 +44,12 @@ sudo ./build/make-usb.sh wipestick-debian.iso /dev/sdX
 
 ## Boot menu
 
-The Debian image uses live-build's standard menus (GRUB on UEFI, syslinux on BIOS), set by a build hook to boot the default entry after 5 seconds. The default entry boots with `nomodeset` (basic framebuffer), which works on nearly all machines without GPU firmware. To run from RAM, press `e` (GRUB) or `Tab` (syslinux) and add `toram`. The Ubuntu image has these as separate menu entries, plus a firmware-setup entry.
+Both images boot the default entry after 5 seconds.
+
+- **Default entry:** loads Intel's graphics driver (i915), which gives native resolution and restores the display after the suspend used to unfreeze SATA drives. The AMD, NVIDIA and newer Intel `xe` drivers are blocked (`module_blacklist=amdgpu,radeon,nouveau,xe`), because without non-free firmware they can leave the screen black. Those machines use the basic firmware display instead. It works, but stays dark after a suspend; the tool then powers off by itself 60 seconds after finishing.
+- **Fail-safe / safe graphics entry:** `nomodeset` for everything. Use it if the screen goes black at boot.
+- The console font is picked at startup: the largest Terminus font that still gives at least 100x30 characters.
+- To run from RAM on the Debian image, press `e` (GRUB) or `Tab` (syslinux) and add `toram`. The Ubuntu image has it as a menu entry.
 
 ## Known limits and fixes
 
@@ -84,7 +89,7 @@ tests/qemu-selftest.sh       boots an ISO in QEMU and runs the self-test
 
 ## Self-test
 
-`tests/qemu-selftest.sh wipestick.iso uefi-sb|bios` boots the image in QEMU with an NVMe drive and a SATA drive full of random data and partitions. The live system runs `wipestick-selftest`, which erases the test drives and powers off. The test passes when the log shows PASS, both drives read back as all zeros, and the boot disk was not listed.
+`tests/qemu-selftest.sh wipestick.iso uefi-sb|bios` boots the image in QEMU with an NVMe drive and a SATA drive full of random data and partitions. The live system runs `wipestick-selftest`, which erases the test drives and powers off. In `bios` mode it first suspends and resumes the VM (the same path as the SATA unfreeze), and the harness checks that the screen updated after resume. That check doesn't run in `uefi-sb` mode because QEMU's UEFI firmware hangs on resume under emulation; real UEFI machines are not affected. The test passes when the log shows PASS, both drives read back as all zeros, and the boot disk was not listed.
 
 The self-test only runs when the VM's SMBIOS OEM strings contain `wipestick-selftest`, and it only erases drives whose serial starts with `WSTEST`. Real hardware never matches either, so on a real machine the service does nothing.
 
@@ -104,7 +109,7 @@ Tested in QEMU (no real hardware yet):
 
 \* An Ubuntu build using Debian's live-boot (`LIVEBOOT=1 build/build-ubuntu.sh`). It exercises the same boot and medium-mount path as the Debian image, which could not be built where this was developed.
 
-**First real-hardware run (Dell OptiPlex 3030 AIO, SanDisk X300 128 GB SATA SSD, v0.1.0):** ATA Sanitize was rejected by the drive (hdparm still reported it as started; the canaries caught it). The firmware had the drive frozen; suspend/resume unfroze it, and ATA Security Erase (enhanced) completed and verified 16/16 in about 9 minutes. The display did not come back after resume (expected with `nomodeset`); v0.1.1 warns about this and powers off automatically.
+**First real-hardware run (Dell OptiPlex 3030 AIO, SanDisk X300 128 GB SATA SSD, v0.1.0):** ATA Sanitize was rejected by the drive (hdparm still reported it as started; the canaries caught it). The firmware had the drive frozen; suspend/resume unfroze it, and ATA Security Erase (enhanced) completed and verified 16/16 in about 9 minutes. The display did not come back after resume because v0.1.0 booted with `nomodeset`; v0.1.2 loads the Intel graphics driver by default to fix this (not yet confirmed on that machine).
 
 **Not yet tested on real drives:** NVMe Sanitize, NVMe crypto Format, and a successful ATA Sanitize. QEMU does not emulate these. Test them on a few spare machines before relying on the tool, and start with `--dry-run` from the root shell.
 

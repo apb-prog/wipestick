@@ -31,7 +31,7 @@ PACKAGES=(
   nvme-cli hdparm gdisk parted util-linux dosfstools e2fsprogs
   whiptail jq dmidecode pciutils smartmontools
   lvm2 mdadm cryptsetup-bin
-  kbd less nano
+  kbd less nano console-setup-linux
 )
 
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
@@ -111,21 +111,22 @@ du -sx --block-size=1 "$CHROOT" | cut -f1 > "$IMAGE/$LIVEDIR/filesystem.size"
 
 echo "==> [6/7] bootloaders"
 echo "wipestick $(sed -n 's/^VERSION="\(.*\)"/\1/p' "$ROOT/src/wipestick") ($SUITE amd64) $(date -u +%Y%m%d)" > "$IMAGE/.disk/info"
+GFX="module_blacklist=amdgpu,radeon,nouveau,xe"
 CMDLINE="$BOOTARG quiet loglevel=3 fsck.mode=skip systemd.show_status=0"
 cat > "$IMAGE/boot/grub/grub.cfg" <<EOF
 set timeout=5
 set default=0
 insmod all_video
 menuentry "wipestick - erase drives" {
-  linux /$LIVEDIR/vmlinuz $CMDLINE nomodeset
+  linux /$LIVEDIR/vmlinuz $CMDLINE $GFX
   initrd /$LIVEDIR/initrd
 }
 menuentry "wipestick - erase drives (run from RAM; USB can be removed)" {
-  linux /$LIVEDIR/vmlinuz $CMDLINE nomodeset toram
+  linux /$LIVEDIR/vmlinuz $CMDLINE $GFX toram
   initrd /$LIVEDIR/initrd
 }
-menuentry "wipestick - graphics drivers enabled (if the screen stays blank)" {
-  linux /$LIVEDIR/vmlinuz $CMDLINE
+menuentry "wipestick - safe graphics (nomodeset, if the screen goes black)" {
+  linux /$LIVEDIR/vmlinuz $CMDLINE nomodeset
   initrd /$LIVEDIR/initrd
 }
 menuentry "Firmware setup (UEFI only)" {

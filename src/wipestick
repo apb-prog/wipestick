@@ -24,7 +24,7 @@
 
 set -uo pipefail
 
-VERSION="0.1.1"
+VERSION="0.1.2"
 DRY_RUN=0
 ALLOW_USB=0
 ALLOW_SUSPEND=1

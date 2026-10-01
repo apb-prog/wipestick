@@ -34,7 +34,7 @@ ACCEL=(-accel tcg -cpu max)
 
 COMMON=(
   -machine q35,smm=on "${ACCEL[@]}" -smp 2 -m 3072
-  -smbios type=11,value=wipestick-selftest
+  -global ICH9-LPC.disable_s3=0
   -drive file=nvme.img,if=none,id=nv,format=raw -device nvme,drive=nv,serial=WSTEST-NVME
   -device ahci,id=ahci
   -drive file=sata.img,if=none,id=sd,format=raw -device ide-hd,drive=sd,bus=ahci.0,serial=WSTEST-SATA,rotation_rate=1
@@ -42,6 +42,7 @@ COMMON=(
   -monitor unix:monitor.sock,server,nowait
 )
 
+SMBIOS=(-smbios type=11,value=wipestick-selftest)
 case $MODE in
   uefi-sb)
     CODE=$(ls /usr/share/OVMF/OVMF_CODE_4M.secboot.fd /usr/share/OVMF/OVMF_CODE.secboot.fd 2>/dev/null | head -n1 || true)
@@ -60,6 +61,8 @@ case $MODE in
   bios)
     cp "$ISO" boot.img
     BOOT=(-drive file=boot.img,if=none,id=bd,format=raw -device ide-hd,drive=bd,bus=ahci.1,serial=WSBOOT-SATA,bootindex=0)
+    # SeaBIOS resumes from S3 reliably under emulation, so test suspend here.
+    SMBIOS=(-smbios type=11,value=wipestick-selftest,value=wipestick-selftest-s3)
     ;;
   *) echo "unknown mode $MODE"; exit 2 ;;
 esac
@@ -80,21 +83,102 @@ PY
     sleep 60
   done
 }
-rm -f shot-*.ppm monitor.sock
+# After the self-test reports it resumed from suspend, screenshot the console
+# and check it is not blank (the display came back).
+mon() {  # send one command to the QEMU monitor, print the reply
+  python3 - "$1" <<'PY' 2>/dev/null || true
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX); s.connect("monitor.sock"); time.sleep(0.3); s.recv(4096)
+s.send((sys.argv[1] + "\n").encode()); time.sleep(1); print(s.recv(4096).decode(errors="replace")); s.close()
+PY
+}
+resume_check() {
+  local i asleep=0 pre=0
+  for (( i = 0; i < TIMEOUT; i += 2 )); do
+    if (( ! pre )) && grep -qa 'SUSPEND-TEST: suspending' serial.log 2>/dev/null; then
+      mon "screendump presuspend.ppm" >/dev/null; pre=1
+    fi
+    # QEMU's RTC alarm does not always wake the VM from S3 (real hardware did).
+    # If the guest stays suspended for 15 s, press the virtual wake button.
+    if mon "info status" | grep -q suspended; then
+      asleep=$(( asleep + 2 ))
+      if (( asleep >= 15 )); then
+        echo "harness: VM still suspended after ${asleep}s; sending system_wakeup"
+        mon system_wakeup >/dev/null; asleep=0
+      fi
+    fi
+    if grep -qa 'SUSPEND-TEST: resumed' serial.log 2>/dev/null; then
+      sleep 2
+      python3 - <<'PY' 2>/dev/null || true
+import socket, time
+s = socket.socket(socket.AF_UNIX); s.connect("monitor.sock"); time.sleep(0.3); s.recv(4096)
+s.send(b"screendump resume.ppm\n"); time.sleep(1); s.close()
+PY
+      return
+    fi
+    grep -qa 'SUSPEND-TEST: skipped' serial.log 2>/dev/null && return
+    sleep 2
+  done
+}
+# Fraction of pixels that differ clearly between two same-size binary PPMs.
+# After resume the self-test prints a banner, so a live display must change.
+changed_fraction() {
+  python3 - "$1" "$2" <<'PY'
+import sys
+def load(path):
+    d = open(path, "rb").read(); parts, pos = [], 0
+    while len(parts) < 4:
+        while d[pos:pos+1].isspace(): pos += 1
+        end = pos
+        while not d[end:end+1].isspace(): end += 1
+        parts.append(d[pos:end]); pos = end
+    return d[pos+1:]
+a, b = load(sys.argv[1]), load(sys.argv[2])
+n = min(len(a), len(b)) // 3
+diff = sum(1 for i in range(0, n * 3, 3) if abs(a[i] - b[i]) + abs(a[i+1] - b[i+1]) + abs(a[i+2] - b[i+2]) > 96)
+print("%.4f" % (diff / max(1, n)))
+PY
+}
+rm -f shot-*.ppm resume.ppm presuspend.ppm monitor.sock
 set +e
-timeout "$TIMEOUT" qemu-system-x86_64 "${COMMON[@]}" "${BOOT[@]}" &
+timeout "$TIMEOUT" qemu-system-x86_64 "${COMMON[@]}" "${SMBIOS[@]}" "${BOOT[@]}" &
 qpid=$!
 screens &
 spid=$!
+resume_check &
+rpid=$!
+# Power-off watchdog: after PASS, allow 120 s for a clean shutdown. QEMU's ACPI
+# power-off sometimes hangs after an S3 resume; quit the VM and say so.
+poweroff_watch() {
+  while ! grep -qa 'WIPESTICK-SELFTEST-PASS\|WIPESTICK-SELFTEST-FAIL' serial.log 2>/dev/null; do sleep 2; done
+  sleep 120
+  echo "harness: WARNING: VM did not power off within 120 s of finishing; forcing quit"
+  touch poweroff-forced
+  mon quit >/dev/null
+}
+rm -f poweroff-forced
+poweroff_watch &
+wpid=$!
 wait "$qpid"
 qrc=$?
-kill "$spid" 2>/dev/null
+kill "$spid" "$rpid" "$wpid" 2>/dev/null
 set -e
 echo "----- serial log -----"; cat serial.log 2>/dev/null; echo "----------------------"
 
 result=0
 if (( qrc == 124 )); then echo "FAIL: VM did not power off within ${TIMEOUT}s"; result=1; fi
 grep -q WIPESTICK-SELFTEST-PASS serial.log 2>/dev/null || { echo "FAIL: self-test did not report PASS"; result=1; }
+if grep -qa 'SUSPEND-TEST: resumed' serial.log; then
+  if [[ -f resume.ppm && -f presuspend.ppm ]]; then
+    chg=$(changed_fraction presuspend.ppm resume.ppm)
+    if awk "BEGIN{exit !($chg > 0.0005)}"; then echo "ok: display updated after resume ($chg of pixels changed)"
+    else echo "FAIL: display did not update after resume ($chg of pixels changed)"; result=1; fi
+  else
+    echo "FAIL: missing before/after screenshots for the resume check"; result=1
+  fi
+elif grep -qa 'SUSPEND-TEST: skipped' serial.log; then
+  echo "WARNING: suspend/resume not tested (VM has no S3)"
+fi
 for img in nvme.img sata.img; do
   if cmp -s -n "$(stat -c %s "$img")" "$img" /dev/zero; then echo "ok: $img is all zeros"
   else echo "FAIL: $img still contains data"; result=1; fi

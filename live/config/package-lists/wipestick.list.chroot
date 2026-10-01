@@ -27,5 +27,6 @@ cryptsetup-bin
 
 # Front end and rescue tools
 whiptail
+console-setup-linux
 less
 nano

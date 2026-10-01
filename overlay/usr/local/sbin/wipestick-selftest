@@ -15,6 +15,25 @@ list=$(wipestick list)
 echo "$list"
 if grep -q 'WSBOOT' <<<"$list"; then echo "FAIL: boot disk is listed as erasable"; fail=1; fi
 
+# Suspend/resume check: the SATA unfreeze path suspends real machines, so make
+# sure the live system (boot medium, services, display driver) survives it.
+drm=$(basename "$(readlink -f /sys/class/drm/card0/device/driver 2>/dev/null)" 2>/dev/null)
+echo "display driver: ${drm:-none (firmware framebuffer)}"
+# Opt-in via a second OEM string: QEMU's UEFI firmware (OVMF) hangs on S3
+# resume under emulation, so the harness only requests this for BIOS boots.
+if dmidecode -t 11 2>/dev/null | grep -q wipestick-selftest-s3 && grep -qw mem /sys/power/state 2>/dev/null; then
+  echo "SUSPEND-TEST: suspending for 5 s"
+  if rtcwake -m mem -s 5 >/dev/null 2>&1; then
+    sleep 3
+    printf '\n\n   WIPESTICK SELF-TEST: RESUMED FROM SUSPEND - DISPLAY OK\n\n' > /dev/tty1
+    echo "SUSPEND-TEST: resumed"
+  else
+    echo "FAIL: rtcwake suspend failed"; fail=1
+  fi
+else
+  echo "SUSPEND-TEST: skipped (not requested, or no S3 in this VM)"
+fi
+
 targets=()
 while IFS=$'\037' read -r dev _ _ _ serial _; do
   [[ $serial == WSTEST* ]] && targets+=("$dev")

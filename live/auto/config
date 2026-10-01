@@ -3,6 +3,11 @@
 # Run via build/build-debian.sh (which syncs src/ and overlay/ first).
 set -e
 
+# Graphics: the default entry lets Intel's i915 driver run (native resolution,
+# and the display comes back after the suspend used to unfreeze SATA drives).
+# amdgpu/radeon/nouveau/xe are blacklisted because without non-free firmware
+# they can leave the screen black; those machines use the firmware framebuffer
+# instead. The fail-safe entry uses nomodeset for everything.
 lb config noauto \
   --mode debian \
   --distribution "${WIPESTICK_SUITE:-trixie}" \
@@ -23,5 +28,6 @@ lb config noauto \
   --iso-volume "WIPESTICK" \
   --iso-application "wipestick" \
   --iso-publisher "wipestick project" \
-  --bootappend-live "boot=live components quiet loglevel=3 nomodeset noeject live-config.hostname=wipestick" \
+  --bootappend-live "boot=live components quiet loglevel=3 noeject live-config.hostname=wipestick module_blacklist=amdgpu,radeon,nouveau,xe" \
+  --bootappend-live-failsafe "boot=live components quiet loglevel=3 noeject live-config.hostname=wipestick nomodeset" \
   "${@}"
