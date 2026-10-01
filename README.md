@@ -10,14 +10,15 @@ A bootable USB that erases every internal drive in a PC and leaves it ready for 
 
 | Drive | Methods, in order |
 |---|---|
-| NVMe | Sanitize crypto erase → Sanitize block erase → Format SES=2 (crypto) → Format SES=1 → TRIM → zero pass |
-| SATA SSD | ATA Sanitize crypto scramble → ATA Sanitize block erase → ATA Security Erase (enhanced if supported) → TRIM → zero pass |
+| NVMe | Sanitize crypto erase → Sanitize block erase → Format SES=2 (crypto) → Format SES=1 → zero pass + TRIM |
+| SATA SSD | ATA Sanitize crypto scramble → ATA Sanitize block erase → ATA Security Erase (enhanced if supported) → zero pass + TRIM |
 | HDD | Single zero pass (NIST 800-88 Clear) |
-| eMMC | Secure erase/trim → TRIM → zero pass |
+| eMMC | Secure erase/trim → zero pass + TRIM |
 
 4. **Verification:** before erasing, 16 random 4 KiB "canary" blocks are written across the drive. After erasing, each is read back. The method only counts as successful if every canary is gone. If not, the next method runs.
-5. Partition tables and filesystem signatures are wiped (`wipefs`, `sgdisk --zap-all`). The disk is blank; Windows or Linux installers take it as-is.
-6. A JSON-lines report (host model/serial, drive model/serial, method, result) and a full log are saved to `wipelogs/` on the stick.
+5. Each result is graded: **Purge** (firmware erase of the whole drive), **Clear** (every block overwritten once; SSD spare areas not reached), or **Logical** (TRIM only, no longer used as a final step).
+6. Partition tables and filesystem signatures are wiped (`wipefs`, `sgdisk --zap-all`). The disk is blank; Windows or Linux installers take it as-is.
+7. A JSON-lines report (host model/serial, drive model/serial, method, result) and a full log are saved to `wipelogs/` on the stick.
 
 ## Build
 
@@ -69,6 +70,7 @@ wipestick list
 wipestick plan /dev/nvme0n1
 wipestick --dry-run erase --confirm ERASE /dev/nvme0n1 /dev/sda
 wipestick erase --confirm ERASE /dev/nvme0n1
+wipestick diag            # saves hardware details to wipelogs/ (also on the end menu)
 ```
 
 The TUI starts automatically on tty1. Choose "Drop to a root shell" from its end menu for manual work. On the Debian image, tty2-tty6 also offer a login as `user` / password `live` (live-config defaults; `sudo` works).
@@ -110,6 +112,8 @@ Tested in QEMU (no real hardware yet):
 \* An Ubuntu build using Debian's live-boot (`LIVEBOOT=1 build/build-ubuntu.sh`). It exercises the same boot and medium-mount path as the Debian image, which could not be built where this was developed.
 
 **First real-hardware run (Dell OptiPlex 3030 AIO, SanDisk X300 128 GB SATA SSD, v0.1.0):** ATA Sanitize was rejected by the drive (hdparm still reported it as started; the canaries caught it). The firmware had the drive frozen; suspend/resume unfroze it, and ATA Security Erase (enhanced) completed and verified 16/16 in about 9 minutes. The display did not come back after resume because v0.1.0 booted with `nomodeset`; v0.1.2 loads the Intel graphics driver by default to fix this (not yet confirmed on that machine).
+
+**Second real-hardware run (Lenovo ThinkPad X1 Carbon 6th gen, Intel SSDPEKKF256G8L NVMe, v0.1.2):** the drive offers no Sanitize, and rejected NVMe Format (SES=2 and SES=1) with Command Sequence Error. That held after a suspend/resume, and its TCG Opal locking was off, so the cause is still unknown. v0.1.2 fell back to TRIM; v0.1.3 falls back to a zero pass plus TRIM (Clear) instead, and records the drive's Opal state.
 
 **Not yet tested on real drives:** NVMe Sanitize, NVMe crypto Format, and a successful ATA Sanitize. QEMU does not emulate these. Test them on a few spare machines before relying on the tool, and start with `--dry-run` from the root shell.
 

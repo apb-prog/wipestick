@@ -22,15 +22,20 @@ sysinfo() {
 end_menu() {
   local choice
   dims
-  choice=$(whiptail --title "$TITLE" --nocancel --menu "What next?" 14 60 4 \
+  choice=$(whiptail --title "$TITLE" --nocancel --menu "What next?" 15 64 5 \
     poweroff "Power off" \
     reboot   "Reboot (remove the USB first to boot the installer)" \
     again    "Start over" \
+    diag     "Save diagnostics to the USB stick" \
     shell    "Drop to a root shell" 3>&1 1>&2 2>&3) || choice=again
   case $choice in
     poweroff) sync; systemctl poweroff 2>/dev/null || poweroff -f ;;
     reboot)   sync; systemctl reboot 2>/dev/null || reboot -f ;;
     shell)    clear; echo "Type 'exit' to return to wipestick."; bash -l ;;
+    diag)     msg "Diagnostics saved to:
+$("$ENGINE" diag 2>&1 | tail -n1)
+
+Bring this file along when reporting a problem." ;;
   esac
 }
 
@@ -82,7 +87,8 @@ Type ERASE (capitals) to continue, or Cancel to go back." "$H" "$W" 3>&1 1>&2 2>
   "$ENGINE" erase --confirm ERASE $selected
   local rc=$? logdir summary
   logdir=$(cat /run/wipestick/log_dir 2>/dev/null)
-  summary=$(awk -F'|' '{printf "%-10s %-7s %-22s canaries %s\n%s", $1, $2, $3, $4, ($5==""?"":"    "$5"\n")}' /run/wipestick/summary 2>/dev/null)
+  summary=$(awk -F'|' '{printf "%-10s %-7s %-6s %-22s canaries %s\n%s", $1, $2, $6, $3, $4, ($5==""?"":"    "$5"\n")}' /run/wipestick/summary 2>/dev/null)
+  local legend="Purge = firmware erase of the whole drive (strongest). Clear = every block overwritten once; spare areas inside an SSD are not reached."
   echo
   # If the engine suspended the machine to unfreeze a drive, the display often
   # does not come back (no GPU driver with nomodeset). Power off on our own.
@@ -97,6 +103,7 @@ Type ERASE (capitals) to continue, or Cancel to go back." "$H" "$W" 3>&1 1>&2 2>
     msg "All selected drives erased and verified. Partition tables are cleared, so the machine is ready for an OS install.
 
 $summary
+$legend
 Log: $logdir"
   else
     msg "One or more drives FAILED.

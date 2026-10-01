@@ -14,6 +14,7 @@
 #   wipestick list                      # eligible drives (TSV)
 #   wipestick plan  <dev>...            # show which methods will be tried
 #   wipestick erase --confirm ERASE <dev>...
+#   wipestick diag                      # save hardware diagnostics to the log folder
 # Options (before the subcommand):
 #   --dry-run       print destructive commands instead of running them
 #   --allow-usb     include USB-attached drives in the eligible list
@@ -24,7 +25,7 @@
 
 set -uo pipefail
 
-VERSION="0.1.2"
+VERSION="0.1.3"
 DRY_RUN=0
 ALLOW_USB=0
 ALLOW_SUSPEND=1
@@ -158,6 +159,41 @@ nvme_ns_count() {
   c=$(devname "$1")
   find /sys/class/nvme/"$c"/ -maxdepth 1 -name "${c}n*" 2>/dev/null | grep -c . || true
 }
+
+# TCG Level 0 Discovery over NVMe Security Receive. Prints one summary line,
+# e.g. "TCG: Opal 2; locking supported, ENABLED, unlocked; Block SID set".
+tcg_level0() {
+  local ctrl=$1 f code flen i end len b out="" proto=""
+  f=$(mktemp)
+  if ! nvme security-recv "$ctrl" -p 1 -s 1 -x 2048 -t 2048 -b > "$f" 2>/dev/null || [[ ! -s $f ]]; then
+    rm -f "$f"; echo "TCG: no response (not a self-encrypting drive, or not supported)"; return 1
+  fi
+  local -a B
+  mapfile -t B < <(od -An -tu1 -v "$f" | tr -s ' ' '\n' | grep -v '^$')
+  rm -f "$f"
+  (( ${#B[@]} >= 48 )) || { echo "TCG: short response"; return 1; }
+  len=$(( (B[0] << 24) | (B[1] << 16) | (B[2] << 8) | B[3] ))
+  end=$(( len + 4 )); (( end > ${#B[@]} )) && end=${#B[@]}
+  i=48
+  while (( i + 4 <= end )); do
+    code=$(( (B[i] << 8) | B[i+1] )); flen=${B[i+3]}
+    b=${B[i+4]:-0}
+    case $code in
+      2)   out+="; locking $( (( b & 1 )) && echo supported || echo unsupported)"
+           out+=", $( (( b & 2 )) && echo ENABLED || echo disabled)"
+           out+=", $( (( b & 4 )) && echo LOCKED || echo unlocked)"
+           (( b & 16 )) && out+=", MBR shadow enabled" ;;
+      512) proto="Opal 1" ;;
+      515) proto="Opal 2" ;;
+      769|770|771) proto="Pyrite" ;;
+      1026) (( b & 2 )) && out+="; Block SID set by firmware" ;;
+    esac
+    i=$(( i + 4 + flen ))
+  done
+  echo "TCG: ${proto:-unknown SSC}${out:-; no locking feature}"
+}
+
+tcg_locking_enabled() { tcg_level0 "$1" | grep -q 'ENABLED'; }
 
 nvme_sstat() {
   nvme sanitize-log "$1" -o json 2>/dev/null |
@@ -397,23 +433,20 @@ methods_for() {
       (( sanicap & 2 )) && echo "nvme-sanitize-block|NVMe Sanitize (block erase)"
       (( fna & 4 ))     && echo "nvme-format-crypto|NVMe Format, crypto erase (SES=2)"
       echo "nvme-format-user|NVMe Format, user data erase (SES=1)"
-      echo "discard|TRIM entire device"
-      echo "zero|Single zero pass"
+      echo "zero-trim|Single zero pass, then TRIM"
       ;;
     sata-ssd|ssd-other)
       ata_has "$dev" CRYPTO_SCRAMBLE_EXT && echo "ata-sanitize-crypto|ATA Sanitize (crypto scramble)"
       ata_has "$dev" BLOCK_ERASE_EXT     && echo "ata-sanitize-block|ATA Sanitize (block erase)"
       ata_sec_supported "$dev"           && echo "ata-secure-erase|ATA Security Erase$(ata_enhanced "$dev" && echo ' (enhanced)')"
-      echo "discard|TRIM entire device"
-      echo "zero|Single zero pass"
+      echo "zero-trim|Single zero pass, then TRIM"
       ;;
     hdd)
       echo "zero|Single zero pass (NIST 800-88 Clear)"
       ;;
     mmc)
       echo "mmc-secure-discard|eMMC secure erase/trim"
-      echo "discard|TRIM entire device"
-      echo "zero|Single zero pass"
+      echo "zero-trim|Single zero pass, then TRIM"
       ;;
   esac
 }
@@ -430,8 +463,22 @@ apply_method() {
     ata-secure-erase)     ata_security_erase "$dev" ;;
     mmc-secure-discard)   secure_discard "$dev" ;;
     discard)              discard "$dev" ;;
+    zero-trim)            zero_fill "$dev" && { discard "$dev" || info "TRIM after zero pass not supported (fine)"; true; } ;;
     zero)                 zero_fill "$dev" ;;
     *) return 1 ;;
+  esac
+}
+
+# Strength of each method, in NIST SP 800-88 terms.
+#   Purge   - firmware erase of all media, including spare/remapped areas
+#   Clear   - every user-addressable block overwritten
+#   Logical - blocks unmapped (TRIM); data may remain in flash until reused
+grade_of() {
+  case $1 in
+    nvme-sanitize-*|nvme-format-*|ata-sanitize-*|ata-secure-erase) echo Purge ;;
+    zero|zero-trim|mmc-secure-discard) echo Clear ;;
+    discard) echo Logical ;;
+    *) echo - ;;
   esac
 }
 
@@ -482,12 +529,47 @@ report() {
     --arg host_model "$(dmidecode -s system-product-name 2>/dev/null | head -n1)" \
     --arg host_serial "$(dmidecode -s system-serial-number 2>/dev/null | head -n1)" \
     --arg method "$3" --arg result "$4" --arg canaries "$5" --arg notes "$6" --argjson dry "$DRY_RUN" \
-    '{time:$time,run:$run,host_model:$host_model,host_serial:$host_serial,device:$dev,class:$class,model:$model,serial:$serial,size_bytes:($size|tonumber? // null),method:$method,result:$result,canaries_erased:$canaries,notes:$notes,dry_run:($dry==1)}' \
+    --arg grade "$(grade_of "$3")" \
+    '{time:$time,run:$run,host_model:$host_model,host_serial:$host_serial,device:$dev,class:$class,model:$model,serial:$serial,size_bytes:($size|tonumber? // null),method:$method,grade:$grade,result:$result,canaries_erased:$canaries,notes:$notes,dry_run:($dry==1)}' \
     >> "$REPORT"
-  echo "$(devname "$1")|$4|$3|$5|$6" >> "$STATE_DIR/summary"
+  echo "$(devname "$1")|$4|$3|$5|$6|$(grade_of "$3")" >> "$STATE_DIR/summary"
 }
 
 # --------------------------------------------------------------- commands
+
+# Save hardware details useful for figuring out why an erase method failed.
+cmd_diag() {
+  local d ctrl out
+  init_logs
+  out="$LOG_DIR/${RUN_ID}_diag.txt"
+  {
+    echo "wipestick $VERSION diagnostics  $(ts)"
+    echo "system: $(dmidecode -s system-manufacturer 2>/dev/null | head -n1) $(dmidecode -s system-product-name 2>/dev/null | head -n1) bios=$(dmidecode -s bios-version 2>/dev/null | head -n1)"
+    echo "kernel: $(uname -r)"; echo
+    platform_warnings; echo
+    lsblk -o NAME,SIZE,TYPE,TRAN,ROTA,MODEL,SERIAL,MOUNTPOINTS; echo
+    for d in $(eligible_drives); do
+      echo "===== $d [$(classify "$d")]"
+      case $(classify "$d") in
+        nvme)
+          ctrl=$(nvme_ctrl "$d")
+          tcg_level0 "$ctrl"
+          nvme id-ctrl "$ctrl" -H 2>&1 | grep -iE '^(mn|fr|oacs|sanicap|fna|frmw)|crypto|format|sanitiz|security'
+          nvme id-ns "$d" 2>&1 | grep -E '^(nsze|flbas|lbaf)'
+          nvme sanitize-log "$ctrl" 2>&1 | head -n 12
+          nvme error-log "$ctrl" -e 8 2>&1 | grep -E 'Entry|error_count|status_field|opcode' | head -n 32
+          ;;
+        *)
+          hdparm -I "$d" 2>&1 | sed -n '/^Model/,/^Logical/p;/Security:/,/^[^[:space:]]/p;/SANITIZE/p;/CRYPTO_SCRAMBLE/p;/BLOCK_ERASE/p'
+          ;;
+      esac
+      echo "plan:"; methods_for "$d" | cut -d'|' -f2 | sed 's/^/  /'
+      echo
+    done
+  } > "$out" 2>&1
+  sync
+  echo "$out"
+}
 
 cmd_plan() {
   local dev m n=0
@@ -510,6 +592,7 @@ erase_one() {
   log "=== $dev  [$class]  $(human "$(size_bytes "$dev")")  $(lsblk -dno MODEL,SERIAL "$dev" | xargs)"
 
   rm -f "$STATE_DIR/pwstuck.$(devname "$dev")"
+  [[ $class == nvme ]] && info "$(tcg_level0 "$(nvme_ctrl "$dev")")"
   teardown "$dev"
   local planted=1
   canary_plant "$dev" "$dir" || { planted=0; notes="canary write failed (drive may be locked: SED/Opal or ATA password)"; info "$notes"; }
@@ -518,6 +601,10 @@ erase_one() {
     log "--- trying: $desc"
     if ! apply_method "$dev" "$m"; then
       info "method failed: $desc"
+      if [[ $m == nvme-* && -z $notes ]] && tcg_locking_enabled "$(nvme_ctrl "$dev")"; then
+        notes="Self-encryption locking (TCG Opal) is enabled on this drive and may be blocking firmware erase. Remove the BIOS hard disk password or BitLocker hardware encryption, or PSID-revert the drive."
+        info "$notes"
+      fi
       # A drive left with an ATA password locks itself at next power-on.
       # Never report such a drive as OK, whatever later methods achieve.
       if [[ -e $STATE_DIR/pwstuck.$(devname "$dev") ]]; then
@@ -540,7 +627,7 @@ erase_one() {
   elif [[ $notes == "canary write failed"* ]]; then
     notes="$notes. If this is a self-encrypting drive, run a PSID revert using the PSID printed on its label."
   fi
-  log "=== $dev: $result via $used"
+  log "=== $dev: $result via $used (grade: $(grade_of "$used"))"
   report "$dev" "$class" "$used" "$result" "$canaries" "$notes"
   rm -rf "$dir"
   [[ $result == OK || $result == DRY-RUN ]]
@@ -587,8 +674,9 @@ main() {
     list)     cmd_list ;;
     warnings) platform_warnings ;;
     plan)     shift; cmd_plan "$@" ;;
+    diag)     cmd_diag ;;
     erase)    shift; cmd_erase "$@" ;;
-    *) die "usage: wipestick [--dry-run] [--allow-usb] {list|plan|erase --confirm ERASE} [dev...]" ;;
+    *) die "usage: wipestick [--dry-run] [--allow-usb] {list|plan|diag|erase --confirm ERASE} [dev...]" ;;
   esac
 }
 

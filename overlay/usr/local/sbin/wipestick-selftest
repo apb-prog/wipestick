@@ -50,6 +50,12 @@ if (( ${#targets[@]} )); then
   ls -la "$logdir" 2>/dev/null
 fi
 
+# Diagnostics command must run cleanly and write its file.
+dfile=$(wipestick diag 2>&1 | tail -n1)
+if [[ -s $dfile ]]; then echo "diag: ok ($dfile)"; grep -E '^TCG:|^=====' "$dfile"; else echo "FAIL: wipestick diag wrote no file"; fail=1; fi
+grep -q '|Purge$' /run/wipestick/summary && grep -q '|Clear$' /run/wipestick/summary \
+  && echo "grades: ok (NVMe Purge, SATA Clear)" || { echo "FAIL: unexpected grades"; cat /run/wipestick/summary; fail=1; }
+
 if (( fail )); then echo "WIPESTICK-SELFTEST-FAIL"; else echo "WIPESTICK-SELFTEST-PASS"; fi
 sync
 systemctl poweroff 2>/dev/null || poweroff -f
