@@ -24,6 +24,8 @@ msg() {
   done <<<"$text"
   (( need > H )) && need=$H
   whiptail --title "$TITLE" --ok-button "$btn" --msgbox "$text" "$need" "$W"
+  MSG_RC=$?
+  return "$MSG_RC"
 }
 yesno() { dims; whiptail --title "$TITLE" --yes-button "$2" --no-button "$3" --yesno "$1" "$H" "$W"; }
 
@@ -38,20 +40,44 @@ sysinfo() {
 # the system runs from it, which otherwise prints harmless "Failed unmounting"
 # messages).
 shutdown_quietly() {
-  local action=$1
+  local action=$1 note=${2:-}
   sync
   dmesg -n 1 2>/dev/null
   mount -o remount,ro /run/live/medium 2>/dev/null || mount -o remount,ro /cdrom 2>/dev/null || true
   clear
   if [[ $action == reboot ]]; then echo "WipeStick: rebooting..."; else echo "WipeStick: powering off..."; fi
+  [[ -n $note ]] && printf '\n%b\n' "$note"
   setterm --cursor off 2>/dev/null
   systemctl "$action" 2>/dev/null || "$action" -f
   sleep 30
 }
 
+POWERCYCLE_NOTE="When the machine is off, wait 10 seconds, then press the power button
+and boot WipeStick again to finish the erase."
+
+# A drive stuck in a firmware erase only recovers when it loses power, and a
+# reboot usually keeps it powered. So in that case offer no Reboot or Start
+# over: power off is the way forward (shell and diagnostics stay for admins).
+needs_powercycle() { [[ -e /run/wipestick/needs-powercycle ]]; }
+
 end_menu() {
   local choice
   dims
+  if needs_powercycle; then
+    while :; do
+      choice=$(whiptail --title "$TITLE" --nocancel --notags --ok-button "$OK_BTN" --menu \
+        "A drive needs a full power-off before it can be erased. Reboot is not offered, because it usually keeps the drive powered." 16 64 3 \
+        poweroff "Power off" \
+        diag     "Save diagnostics to the USB stick" \
+        shell    "Drop to a root shell" 3>&1 1>&2 2>&3) || continue
+      case $choice in
+        poweroff) shutdown_quietly poweroff "$POWERCYCLE_NOTE" ;;
+        shell)    clear; echo "Type 'exit' to return to WipeStick."; bash -l ;;
+        diag)     msg "Diagnostics saved to:
+$("$ENGINE" diag 2>&1 | tail -n1)" ;;
+      esac
+    done
+  fi
   choice=$(whiptail --title "$TITLE" --nocancel --notags --ok-button "$OK_BTN" --menu "What next?" 15 64 5 \
     poweroff "Power off" \
     reboot   "Reboot" \
@@ -152,12 +178,19 @@ Press Enter or Esc to return to drive selection menu." "Press Enter to Return"
   else
     read -rp "Press Enter for the summary..." _
   fi
+  local pc_head="" pc_btn="Press Enter to Continue"
+  if needs_powercycle; then
+    pc_head="
+A drive is stuck in a firmware erase and must be POWERED OFF (not rebooted) to recover. Press Enter to power off now.
+"
+    pc_btn="Press Enter to Power Off"
+  fi
   if [[ -e /run/wipestick/interrupted ]]; then
     msg "Process interrupted by user.
 Drives marked INTERRUPTED or NOT STARTED must be treated as NOT erased. Run the erase again to finish them.
-
+$pc_head
 $summary
-Log: $logdir" "Press Enter to Continue"
+Log: $logdir" "$pc_btn"
   elif (( rc == 0 )); then
     msg "Operation successful.
 All selected drives were erased and verified. All data and partition tables have been cleared.
@@ -169,13 +202,25 @@ Log: $logdir
 
 Press Enter to continue." "Press Enter to Continue"
   else
-    msg "One or more drives FAILED and must be treated as NOT erased.
+    if needs_powercycle; then
+      msg "One or more drives FAILED and must be treated as NOT erased.
+$pc_head
+$summary
+Log: $logdir" "$pc_btn"
+    else
+      msg "One or more drives FAILED and must be treated as NOT erased.
 
 $summary
 Common fixes: set storage mode to AHCI; for self-encrypting drives, do a PSID revert; for frozen SATA drives, hot-plug the drive or try another port.
 Log: $logdir
 
 Press Enter to continue." "Press Enter to Continue"
+    fi
+  fi
+  # Enter on the summary powers off when a drive needs it; Esc goes to the
+  # (power-off-only) menu instead, e.g. to save diagnostics first.
+  if needs_powercycle && (( MSG_RC == 0 )); then
+    shutdown_quietly poweroff "$POWERCYCLE_NOTE"
   fi
   end_menu
 }

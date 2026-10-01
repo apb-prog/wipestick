@@ -221,7 +221,8 @@ after_stall() {
   local dev=$1 family=$2 busy=$3
   record_stall "$dev" "$family"
   if (( busy )); then
-    LADDER_STOP="Firmware erase stalled (no progress for $(mmss "$P_LIMIT")) and the drive is still busy with it, so it will refuse other erase methods until power-cycled. Power off, wait 10 seconds, boot WipeStick and erase again; this method will be skipped for this drive next time."
+    LADDER_STOP="Firmware erase stalled (no progress for $(mmss "$P_LIMIT")) and the drive is still busy with it, so it will refuse other erase methods until it is powered off. This method will be skipped for this drive next time."
+    touch "$STATE_DIR/needs-powercycle"
     info "drive is still busy with the stalled sanitize; skipping remaining methods"
   else
     info "drive left the stalled sanitize; trying the next method"
@@ -911,6 +912,8 @@ on_interrupt() {
     [[ -e $STATE_DIR/pwstuck.$(devname "$CUR_DEV") ]] && notes+=" ATA password '$ATA_PASS' is still set; unlock from the root shell: hdparm --user-master u --security-disable $ATA_PASS $CUR_DEV"
     st=$(sanitize_status_of "$CUR_DEV")
     [[ -n $st ]] && { info "$st"; notes+=" $st"; }
+    # A sanitize still running blocks the drive until it finishes or loses power.
+    grep -qiE 'in process|in progress' <<<"$st" && touch "$STATE_DIR/needs-powercycle"
     report "$CUR_DEV" "$(classify "$CUR_DEV")" "${CUR_METHOD:-none}" INTERRUPTED - "$notes"
   fi
   for dev in "${PENDING_DEVS[@]}"; do
@@ -936,7 +939,7 @@ cmd_erase() {
   done
   init_logs
   : > "$STATE_DIR/summary"
-  rm -f "$STATE_DIR/suspended" "$STATE_DIR/interrupted"
+  rm -f "$STATE_DIR/suspended" "$STATE_DIR/interrupted" "$STATE_DIR/needs-powercycle"
   trap on_interrupt INT TERM HUP
   local w; while read -r w; do [[ -n $w ]] && log "WARNING: $w"; done < <(platform_warnings)
   PENDING_DEVS=("$@")
