@@ -43,6 +43,24 @@ done < <(tail -n +2 <<<"$list" | tr '\t' '\037')   # tabs collapse empty fields
 echo "targets: ${targets[*]:-none}"
 (( ${#targets[@]} )) || { echo "FAIL: no WSTEST drives found"; fail=1; }
 
+# Interrupt check: stop an erase once it reaches the SATA zero pass; the
+# summary must say INTERRUPTED. (SIGTERM: background jobs ignore SIGINT, and
+# both run the same handler as Ctrl+C.) The real erase below then starts over.
+if (( ${#targets[@]} )); then
+  wipestick erase --confirm ERASE "${targets[@]}" >/dev/null 2>&1 &
+  epid=$!
+  for _ in $(seq 1 240); do
+    grep -qs 'trying: Single zero pass' "$(cat /run/wipestick/log_dir 2>/dev/null)"/*.log && break
+    sleep 0.5
+  done
+  kill -TERM "$epid" 2>/dev/null; wait "$epid"; erc=$?
+  if (( erc == 130 )) && grep -q '|INTERRUPTED|' /run/wipestick/summary && [[ -e /run/wipestick/interrupted ]]; then
+    echo "interrupt: ok"; grep '|INTERRUPTED|' /run/wipestick/summary
+  else
+    echo "FAIL: interrupt not recorded (exit $erc)"; cat /run/wipestick/summary; fail=1
+  fi
+fi
+
 if (( ${#targets[@]} )); then
   wipestick plan "${targets[@]}"
   wipestick erase --confirm ERASE "${targets[@]}" || { echo "FAIL: erase returned non-zero"; fail=1; }

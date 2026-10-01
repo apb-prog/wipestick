@@ -63,9 +63,7 @@ end_menu() {
     reboot)   shutdown_quietly reboot ;;
     shell)    clear; echo "Type 'exit' to return to WipeStick."; bash -l ;;
     diag)     msg "Diagnostics saved to:
-$("$ENGINE" diag 2>&1 | tail -n1)
-
-Bring this file along when reporting a problem." ;;
+$("$ENGINE" diag 2>&1 | tail -n1)" ;;
   esac
 }
 
@@ -125,12 +123,24 @@ Press Enter or Esc to return to drive selection menu." "Press Enter to Return"
 
   clear
   echo "WipeStick: erasing - do not power off or remove the USB stick."
+  echo "To stop, press Ctrl+C."
   echo
+  # Ctrl+C reaches the engine, which records what it interrupted and exits.
+  # Catch it here too, so this script survives to show the summary.
+  trap 'echo "Stopping..."' INT
   # shellcheck disable=SC2086
   "$ENGINE" erase --confirm ERASE $selected
   local rc=$? logdir summary
+  trap - INT
   logdir=$(cat /run/wipestick/log_dir 2>/dev/null)
-  summary=$(awk -F'|' '{printf "%-10s %-7s %-6s %-22s canaries %s\n%s", $1, $2, $6, $3, $4, ($5==""?"":"    "$5"\n")}' /run/wipestick/summary 2>/dev/null)
+  # One line per drive, then its notes, with the sanitize status on its own line.
+  summary=$(awk -F'|' '{
+      notes = $5; gsub(/ *(ATA|NVMe) sanitize status: */, "\n    Sanitize status: ", notes)
+      sub(/^\n/, "", notes)
+      if ($2 == "OK" || $2 == "DRY-RUN") printf "%-6s %-11s %-6s %-22s canaries %s\n", $1, $2, $6, $3, $4
+      else printf "%-6s %s\n", $1, $2
+      if (notes != "") printf "    %s\n", notes
+    }' /run/wipestick/summary 2>/dev/null)
   local legend="Purge = firmware erase of the whole drive (strongest). Clear = every block overwritten once; spare areas inside an SSD are not reached."
   echo
   # If the engine suspended the machine to unfreeze a drive and no graphics
@@ -142,7 +152,13 @@ Press Enter or Esc to return to drive selection menu." "Press Enter to Return"
   else
     read -rp "Press Enter for the summary..." _
   fi
-  if (( rc == 0 )); then
+  if [[ -e /run/wipestick/interrupted ]]; then
+    msg "Process interrupted by user.
+Drives marked INTERRUPTED or NOT STARTED must be treated as NOT erased. Run the erase again to finish them.
+
+$summary
+Log: $logdir" "Press Enter to Continue"
+  elif (( rc == 0 )); then
     msg "Operation successful.
 All selected drives were erased and verified. All data and partition tables have been cleared.
 
@@ -153,7 +169,7 @@ Log: $logdir
 
 Press Enter to continue." "Press Enter to Continue"
   else
-    msg "One or more drives FAILED.
+    msg "One or more drives FAILED and must be treated as NOT erased.
 
 $summary
 Common fixes: set storage mode to AHCI; for self-encrypting drives, do a PSID revert; for frozen SATA drives, hot-plug the drive or try another port.

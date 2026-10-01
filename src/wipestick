@@ -25,7 +25,7 @@
 
 set -uo pipefail
 
-VERSION="0.1.4"
+VERSION="0.1.5"
 DRY_RUN=0
 ALLOW_USB=0
 ALLOW_SUSPEND=1
@@ -35,6 +35,18 @@ CANARY_BS=4096
 ATA_PASS="wipestick"
 STATE_DIR="/run/wipestick"
 RUN_LOG="/dev/null"
+POLL_SECS=${WIPESTICK_POLL_SECS:-5}
+# A firmware sanitize reports progress as a counter out of 65535, so a drive
+# that is really working moves it every few seconds, even on multi-hour jobs.
+# If the counter does not move at all for this long, the drive has stalled.
+STALL_SECS=${WIPESTICK_STALL_SECS:-300}
+# Hard drives get longer, in case their firmware only updates progress coarsely.
+STALL_SECS_HDD=${WIPESTICK_STALL_SECS_HDD:-1800}
+
+# Set while an erase runs, so the Ctrl+C handler can say what was interrupted.
+CUR_DEV=""; CUR_METHOD=""; CUR_DESC=""
+LADDER_STOP=""     # set by a method when no later method can work this boot
+PENDING_DEVS=()
 
 # ---------------------------------------------------------------- utilities
 
@@ -145,6 +157,77 @@ platform_warnings() {
   return 0
 }
 
+# ------------------------------------------------------- progress watching
+
+mmss() {
+  if (( $1 >= 60 && $1 % 60 == 0 )); then echo "$(( $1 / 60 )) min"
+  else printf '%dm%02ds' $(( $1 / 60 )) $(( $1 % 60 )); fi
+}
+
+stall_limit() {
+  if [[ $(cat "/sys/block/$(devname "$1")/queue/rotational" 2>/dev/null) == 1 ]]; then
+    echo "$STALL_SECS_HDD"
+  else
+    echo "$STALL_SECS"
+  fi
+}
+
+# Shared by the sanitize loops: progress_reset <limit> before polling, then
+# progress_tick <counter 0-65535> on every poll. Prints a line when the value
+# changes and once a minute otherwise. Fails once it has not moved for <limit>.
+progress_reset() { P_LAST=""; P_SINCE=$SECONDS; P_SAID=$SECONDS; P_LIMIT=$1; }
+progress_tick() {
+  local raw=$1 pct idle
+  pct=$(( raw * 100 / 65535 ))
+  if [[ $raw != "$P_LAST" ]]; then
+    [[ -n $P_LAST ]] && P_SINCE=$SECONDS
+    P_LAST=$raw; P_SAID=$SECONDS
+    info "progress: $pct% ($(printf '0x%x' "$raw"))"
+    return 0
+  fi
+  idle=$(( SECONDS - P_SINCE ))
+  if (( idle >= P_LIMIT )); then
+    info "STALLED: progress stuck at $pct% ($(printf '0x%x' "$raw")) for $(mmss "$idle")"
+    return 1
+  fi
+  if (( SECONDS - P_SAID >= 60 )); then
+    P_SAID=$SECONDS
+    info "progress: $pct% (no change for $(mmss "$idle"); moving on at $(mmss "$P_LIMIT") without change)"
+  fi
+  return 0
+}
+
+# A sanitize that stalls once on a drive tends to stall again, so remember it
+# on the log medium (it survives reboots) and skip that method next time.
+drive_key() {
+  local s
+  s=$(lsblk -dno SERIAL "$1" 2>/dev/null | xargs)
+  [[ -n $s ]] || s="$(lsblk -dno MODEL "$1" 2>/dev/null | xargs)-$(size_bytes "$1" 2>/dev/null)"
+  echo "${s// /_}"
+}
+stall_file() { echo "${LOG_DIR:-$STATE_DIR}/stalled-drives.txt"; }
+stalled_before() {   # stalled_before dev family(ata-sanitize|nvme-sanitize)
+  grep -qs "^$(drive_key "$1")	$2	" "$(stall_file)"
+}
+record_stall() {
+  stalled_before "$1" "$2" && return 0
+  printf '%s\t%s\t%s\t%s\n' "$(drive_key "$1")" "$2" "$(lsblk -dno MODEL "$1" 2>/dev/null | xargs)" "$(ts)" >> "$(stall_file)"
+  sync
+}
+
+# After a stall: if the drive is still busy, nothing else will work until it
+# is power-cycled, so stop trying further methods on it this boot.
+after_stall() {
+  local dev=$1 family=$2 busy=$3
+  record_stall "$dev" "$family"
+  if (( busy )); then
+    LADDER_STOP="Firmware erase stalled (no progress for $(mmss "$P_LIMIT")) and the drive is still busy with it, so it will refuse other erase methods until power-cycled. Power off, wait 10 seconds, boot WipeStick and erase again; this method will be skipped for this drive next time."
+    info "drive is still busy with the stalled sanitize; skipping remaining methods"
+  else
+    info "drive left the stalled sanitize; trying the next method"
+  fi
+}
+
 # ------------------------------------------------------------- nvme helpers
 
 nvme_ctrl() {
@@ -195,30 +278,60 @@ tcg_level0() {
 
 tcg_locking_enabled() { tcg_level0 "$1" | grep -q 'ENABLED'; }
 
+# Prints "<sstat> <sprog>" as numbers; "0 0" when the drive does not report them.
 nvme_sstat() {
-  nvme sanitize-log "$1" -o json 2>/dev/null |
-    jq -r '[.. | objects | select(has("sstat"))][0] | "\(.sstat) \(.sprog)"' 2>/dev/null
+  local st prog
+  read -r st prog < <(nvme sanitize-log "$1" -o json 2>/dev/null |
+    jq -r '[.. | objects | select(has("sstat"))][0] | "\(.sstat) \(.sprog)"' 2>/dev/null)
+  [[ ${st:-} =~ ^[0-9]+$ ]] || st=0
+  [[ ${prog:-} =~ ^[0-9]+$ ]] || prog=0
+  echo "$st $prog"
+}
+
+# One-line sanitize state for the summary screen.
+nvme_sanitize_status() {
+  local st prog
+  [[ $(nvme_idctrl_field "$1" sanicap) != 0 ]] || return 0   # no sanitize support
+  read -r st prog < <(nvme_sstat "$1")
+  case $(( st & 7 )) in
+    0) echo "NVMe sanitize status: never sanitized" ;;
+    1|4) echo "NVMe sanitize status: last sanitize completed" ;;
+    2) echo "NVMe sanitize status: IN PROGRESS, $(( ${prog:-0} * 100 / 65535 ))%" ;;
+    3) echo "NVMe sanitize status: last sanitize FAILED" ;;
+    *) echo "NVMe sanitize status: unknown (sstat=$st)" ;;
+  esac
 }
 
 nvme_sanitize() {
-  local dev=$1 act=$2 ctrl st prog code waited=0
+  local dev=$1 act=$2 ctrl
   ctrl=$(nvme_ctrl "$dev")
   run nvme sanitize "$ctrl" --sanact="$act" || return 1
   (( DRY_RUN )) && return 0
   sleep 2
+  nvme_sanitize_wait "$dev"
+}
+
+# Wait for a running NVMe sanitize: 0 finished, 1 failed or stalled.
+nvme_sanitize_wait() {
+  local dev=$1 ctrl st prog code waited=0
+  ctrl=$(nvme_ctrl "$dev")
+  progress_reset "$(stall_limit "$dev")"
   while :; do
     read -r st prog < <(nvme_sstat "$ctrl")
     code=$(( ${st:-0} & 7 ))
     case $code in
-      2) info "sanitize in progress: $(( ${prog:-0} * 100 / 65535 ))%";;
+      2) progress_tick "${prog:-0}" || {
+           read -r st prog < <(nvme_sstat "$ctrl")
+           after_stall "$dev" nvme-sanitize $(( (${st:-0} & 7) == 2 ))
+           return 1; } ;;
       1|4) info "sanitize completed (sstat=$st)"; break ;;
       3) info "sanitize reported FAILURE (sstat=$st)"
          run nvme sanitize "$ctrl" --sanact=1 >/dev/null 2>&1   # exit failure mode
          return 1 ;;
       *) info "unexpected sanitize status (sstat=${st:-none})"; (( waited > 30 )) && return 1 ;;
     esac
-    sleep 5; waited=$(( waited + 5 ))
-    (( waited > 14400 )) && { info "sanitize timed out after 4h"; return 1; }
+    sleep "$POLL_SECS"; waited=$(( waited + POLL_SECS ))
+    (( waited > 43200 )) && { info "sanitize timed out after 12h"; return 1; }
   done
   nvme ns-rescan "$ctrl" >/dev/null 2>&1 || true
   sleep 1
@@ -287,8 +400,36 @@ try_unfreeze() {
   return 0
 }
 
+# Read ATA sanitize status into S_STATE (busy|done|idle|failed|frozen|unknown),
+# S_RAW (progress counter 0-65535) and S_TEXT (one line for logs and summaries).
+ata_sanitize_poll() {
+  local out
+  out=$(hdparm --sanitize-status "$1" 2>&1)
+  S_RAW=0
+  S_TEXT=$(grep -iE 'State:|Progress:|Without Error|Reason|Antifreeze|SG_IO|failed' <<<"$out" |
+           sed 's/^[[:space:]]*//' | tr -s ' \t' '  ' | paste -sd';' - | sed 's/;/; /g')
+  if grep -qiE 'in process|progress:' <<<"$out"; then
+    S_STATE=busy
+    S_RAW=$(grep -oiE 'progress: 0x[0-9a-f]+' <<<"$out" | grep -oiE '0x[0-9a-f]+' | head -n1)
+    S_RAW=$(( ${S_RAW:-0} ))
+  elif grep -qi 'operation failed' <<<"$out"; then S_STATE=failed
+  elif grep -qi 'sanitize frozen' <<<"$out";  then S_STATE=frozen
+  elif grep -qi 'completed without error' <<<"$out"; then S_STATE=complete
+  elif grep -qi 'sanitize idle' <<<"$out"; then S_STATE=idle
+  else S_STATE=unknown
+  fi
+  [[ -n $S_TEXT ]] || S_TEXT=$(xargs <<<"$out" 2>/dev/null | cut -c1-160)
+  return 0
+}
+
+ata_sanitize_status() {
+  ata_has "$1" 'SANITIZE feature set' || return 0
+  ata_sanitize_poll "$1"
+  echo "ATA sanitize status: ${S_TEXT:-not reported}"
+}
+
 ata_sanitize() {
-  local dev=$1 op=$2 out rc waited=0 seen_busy=0
+  local dev=$1 op=$2 out rc
   if (( DRY_RUN )); then info "[dry-run] hdparm --yes-i-know-what-i-am-doing $op $dev"; return 0; fi
   info "+ hdparm --yes-i-know-what-i-am-doing $op $dev"
   out=$(hdparm --yes-i-know-what-i-am-doing "$op" "$dev" 2>&1); rc=$?
@@ -299,22 +440,56 @@ ata_sanitize() {
     info "drive rejected the sanitize command"
     return 1
   fi
+  sleep 2
+  ata_sanitize_wait "$dev"
+}
+
+# Wait for a running ATA sanitize: 0 finished, 1 failed or stalled.
+ata_sanitize_wait() {
+  local dev=$1 seen_busy=0 waited=0
+  progress_reset "$(stall_limit "$dev")"
   while :; do
-    out=$(hdparm --sanitize-status "$dev" 2>&1)
-    if grep -qiE 'in process|progress' <<<"$out"; then
-      seen_busy=1
-      info "$(grep -iE 'progress' <<<"$out" | head -n1 | xargs)"
-    elif grep -qi 'completed without error' <<<"$out"; then
-      (( seen_busy )) || info "sanitize reported complete without a visible in-progress state (verification will confirm)"
-      info "sanitize completed"; return 0
-    elif grep -qiE 'failed|error' <<<"$out"; then
-      info "sanitize failed: $(xargs <<<"$out")"; return 1
-    else
-      (( waited > 30 )) && { info "sanitize status unclear: $(xargs <<<"$out")"; return 0; }
-    fi
-    sleep 5; waited=$(( waited + 5 ))
-    (( waited > 43200 )) && return 1
+    ata_sanitize_poll "$dev"
+    case $S_STATE in
+      busy)
+        seen_busy=1
+        if ! progress_tick "$S_RAW"; then
+          ata_sanitize_poll "$dev"
+          info "sanitize status: $S_TEXT"
+          after_stall "$dev" ata-sanitize "$([[ $S_STATE == busy ]] && echo 1 || echo 0)"
+          return 1
+        fi ;;
+      complete)
+        (( seen_busy )) || info "sanitize reported complete without a visible in-progress state (verification will confirm)"
+        info "sanitize completed"; return 0 ;;
+      failed) info "sanitize failed: $S_TEXT"; return 1 ;;
+      frozen) info "sanitize is frozen by firmware: $S_TEXT"; return 1 ;;
+      *)
+        if (( seen_busy )); then info "sanitize finished ($S_TEXT); verification will confirm"; return 0; fi
+        (( waited > 30 )) && { info "sanitize status unclear: $S_TEXT"; return 0; } ;;
+    esac
+    sleep "$POLL_SECS"; waited=$(( waited + POLL_SECS ))
+    (( waited > 43200 )) && { info "sanitize timed out after 12h"; return 1; }
   done
+}
+
+# Never leave a password on the drive, whatever happened, and say so
+# explicitly in the log so the erase report shows the drive is unlocked.
+clear_temp_password() {
+  local dev=$1
+  (( DRY_RUN )) && return 0
+  if ata_sec_enabled "$dev"; then
+    info "clearing temporary ATA password"
+    hdparm --user-master u --security-disable "$ATA_PASS" "$dev" >/dev/null 2>&1
+  fi
+  if ata_sec_enabled "$dev"; then
+    info "WARNING: ATA password is still set on $dev. It is: $ATA_PASS"
+    info "Unlock with: hdparm --user-master u --security-disable $ATA_PASS $dev"
+    touch "$STATE_DIR/pwstuck.$(devname "$dev")"
+    return 1
+  fi
+  info "ATA security: no password set (drive unlocked)"
+  return 0
 }
 
 ata_security_erase() {
@@ -325,22 +500,7 @@ ata_security_erase() {
   ata_enhanced "$dev" && mode="--security-erase-enhanced"
   run hdparm --user-master u --security-set-pass "$ATA_PASS" "$dev" || return 1
   run hdparm --user-master u "$mode" "$ATA_PASS" "$dev"; rc=$?
-  # Never leave a password on the drive, whatever happened above, and say so
-  # explicitly in the log so the erase report shows the drive is unlocked.
-  if (( ! DRY_RUN )); then
-    if ata_sec_enabled "$dev"; then
-      info "clearing temporary ATA password"
-      hdparm --user-master u --security-disable "$ATA_PASS" "$dev" >/dev/null 2>&1
-    fi
-    if ata_sec_enabled "$dev"; then
-      info "WARNING: ATA password is still set on $dev. It is: $ATA_PASS"
-      info "Unlock with: hdparm --user-master u --security-disable $ATA_PASS $dev"
-      touch "$STATE_DIR/pwstuck.$(devname "$dev")"
-      rc=1
-    else
-      info "ATA security: no password set (drive unlocked)"
-    fi
-  fi
+  clear_temp_password "$dev" || rc=1
   return "$rc"
 }
 
@@ -504,7 +664,9 @@ grade_of() {
 
 # ---------------------------------------------------------------- logging
 
-init_logs() {
+# Find (and mount) where logs go: WIPELOGS partition, else the FAT32 boot
+# stick, else RAM. Sets LOG_DIR and RUN_ID without creating any file.
+resolve_log_dir() {
   mkdir -p "$STATE_DIR"
   if [[ -z $LOG_DIR ]]; then
     local part fstype
@@ -526,9 +688,14 @@ init_logs() {
     [[ -z $LOG_DIR ]] && LOG_DIR=$STATE_DIR/logs
   fi
   mkdir -p "$LOG_DIR"
-  local host_serial
-  host_serial=$(dmidecode -s system-serial-number 2>/dev/null | head -n1 | tr -c 'A-Za-z0-9_\n-' '_' )
-  RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)_${host_serial:-unknown}"
+  echo "$LOG_DIR" > "$STATE_DIR/log_dir"
+  HOST_SERIAL=$(dmidecode -s system-serial-number 2>/dev/null | head -n1 | tr -c 'A-Za-z0-9_\n-' '_' )
+  RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)_${HOST_SERIAL:-unknown}"
+}
+
+init_logs() {
+  resolve_log_dir
+  local host_serial=$HOST_SERIAL
   RUN_LOG="$LOG_DIR/$RUN_ID.log"
   REPORT="$LOG_DIR/$RUN_ID.jsonl"
   {
@@ -537,8 +704,11 @@ init_logs() {
     echo "kernel: $(uname -r)  dry_run=$DRY_RUN"
   } >> "$RUN_LOG"
   [[ $LOG_DIR == "$STATE_DIR"/* ]] && log "NOTE: logs are in RAM ($LOG_DIR) and will be lost at reboot"
-  echo "$LOG_DIR" > "$STATE_DIR/log_dir"
+  return 0
 }
+
+# A grade only means something for a drive that was actually erased.
+grade_for() { if [[ $2 == OK || $2 == DRY-RUN ]]; then grade_of "$1"; else echo -; fi; }
 
 report() {
   # report dev class method result canaries notes
@@ -549,10 +719,10 @@ report() {
     --arg host_model "$(dmidecode -s system-product-name 2>/dev/null | head -n1)" \
     --arg host_serial "$(dmidecode -s system-serial-number 2>/dev/null | head -n1)" \
     --arg method "$3" --arg result "$4" --arg canaries "$5" --arg notes "$6" --argjson dry "$DRY_RUN" \
-    --arg grade "$(grade_of "$3")" \
+    --arg grade "$(grade_for "$3" "$4")" \
     '{time:$time,run:$run,host_model:$host_model,host_serial:$host_serial,device:$dev,class:$class,model:$model,serial:$serial,size_bytes:($size|tonumber? // null),method:$method,grade:$grade,result:$result,canaries_erased:$canaries,notes:$notes,dry_run:($dry==1)}' \
     >> "$REPORT"
-  echo "$(devname "$1")|$4|$3|$5|$6|$(grade_of "$3")" >> "$STATE_DIR/summary"
+  echo "$(devname "$1")|$4|$3|$5|$6|$(grade_for "$3" "$4")" >> "$STATE_DIR/summary"
 }
 
 # --------------------------------------------------------------- commands
@@ -560,7 +730,7 @@ report() {
 # Save hardware details useful for figuring out why an erase method failed.
 cmd_diag() {
   local d ctrl out
-  init_logs
+  resolve_log_dir
   out="$LOG_DIR/${RUN_ID}_diag.txt"
   {
     echo "wipestick $VERSION diagnostics  $(ts)"
@@ -582,8 +752,11 @@ cmd_diag() {
           ;;
         *)
           hdparm -I "$d" 2>&1 | sed -n '/^Model/,/^Logical/p;/Security:/,/^[^[:space:]]/p;/SANITIZE/p;/CRYPTO_SCRAMBLE/p;/BLOCK_ERASE/p'
+          ata_sanitize_status "$d"
           ;;
       esac
+      stalled_before "$d" ata-sanitize && echo "NOTE: ATA Sanitize stalled on this drive in an earlier run; it will be skipped"
+      stalled_before "$d" nvme-sanitize && echo "NOTE: NVMe Sanitize stalled on this drive in an earlier run; it will be skipped"
       echo "plan:"; methods_for "$d" | cut -d'|' -f2 | sed 's/^/  /'
       echo
     done
@@ -594,6 +767,7 @@ cmd_diag() {
 
 cmd_plan() {
   local dev m n=0
+  resolve_log_dir   # to find the stalled-drives list
   for dev in "$@"; do
     echo "$dev  [$(classify "$dev")]  $(human "$(size_bytes "$dev")")  $(lsblk -dno MODEL "$dev" | xargs)"
     if [[ $(classify "$dev") == nvme ]] && (( $(nvme_ns_count "$(nvme_ctrl "$dev")") > 1 )); then
@@ -601,57 +775,151 @@ cmd_plan() {
     fi
     n=0
     while IFS='|' read -r m desc; do
+      if skip_reason "$dev" "$m" >/dev/null; then echo "    -  $desc (skipped: $(skip_reason "$dev" "$m"))"; continue; fi
       n=$(( n + 1 )); echo "    $n. $desc"
     done < <(methods_for "$dev")
   done
 }
 
+# Prints why a method is skipped for this drive, or fails if it is not.
+skip_reason() {
+  case $2 in
+    ata-sanitize-*)  stalled_before "$1" ata-sanitize  && { echo "it stalled on this drive in an earlier run"; return 0; } ;;
+    nvme-sanitize-*) stalled_before "$1" nvme-sanitize && { echo "it stalled on this drive in an earlier run"; return 0; } ;;
+  esac
+  return 1
+}
+
+# Current sanitize state, for summaries of drives that were not erased.
+sanitize_status_of() {
+  case $(classify "$1") in
+    nvme) nvme_sanitize_status "$(nvme_ctrl "$1")" ;;
+    mmc)  ;;
+    *)    ata_sanitize_status "$1" ;;
+  esac
+}
+
+# A sanitize keeps running inside the drive across reboots. If one is still
+# going from an earlier attempt, wait for it before anything else (the drive
+# refuses reads and writes meanwhile). Fails if it stalls or fails.
+wait_for_leftover_sanitize() {
+  local dev=$1 st prog
+  case $(classify "$dev") in
+    nvme)
+      read -r st prog < <(nvme_sstat "$(nvme_ctrl "$dev")")
+      (( (${st:-0} & 7) == 2 )) || return 0
+      info "drive is still running a sanitize from an earlier attempt; waiting for it to finish"
+      CUR_METHOD=nvme-sanitize-leftover; CUR_DESC="NVMe Sanitize left running by an earlier attempt"
+      nvme_sanitize_wait "$dev" ;;
+    mmc) return 0 ;;
+    *)
+      ata_has "$dev" 'SANITIZE feature set' || return 0
+      ata_sanitize_poll "$dev"
+      [[ $S_STATE == busy ]] || return 0
+      info "drive is still running a sanitize from an earlier attempt; waiting for it to finish"
+      CUR_METHOD=ata-sanitize-leftover; CUR_DESC="ATA Sanitize left running by an earlier attempt"
+      ata_sanitize_wait "$dev" ;;
+  esac
+}
+
 erase_one() {
-  local dev=$1 class dir m desc result="FAILED" used="none" canaries="-" notes=""
+  local dev=$1 class dir m desc result="FAILED" used="none" canaries="-" notes="" planted=1
   class=$(classify "$dev")
   dir=$(mktemp -d "$STATE_DIR/$(devname "$dev").XXXX")
+  CUR_DIR=$dir; CUR_DEV=$dev; CUR_METHOD=""; CUR_DESC=""; LADDER_STOP=""
   log "=== $dev  [$class]  $(human "$(size_bytes "$dev")")  $(lsblk -dno MODEL,SERIAL "$dev" | xargs)"
 
   rm -f "$STATE_DIR/pwstuck.$(devname "$dev")"
   [[ $class == nvme ]] && info "$(tcg_level0 "$(nvme_ctrl "$dev")")"
   teardown "$dev"
-  local planted=1
-  canary_plant "$dev" "$dir" || { planted=0; notes="canary write failed (drive may be locked: SED/Opal or ATA password)"; info "$notes"; }
 
-  while IFS='|' read -r m desc; do
-    log "--- trying: $desc"
-    if ! apply_method "$dev" "$m"; then
-      info "method failed: $desc"
-      if [[ $m == nvme-* && -z $notes ]] && tcg_locking_enabled "$(nvme_ctrl "$dev")"; then
-        notes="Self-encryption locking (TCG Opal) is enabled on this drive and may be blocking firmware erase. Remove the BIOS hard disk password or BitLocker hardware encryption, or PSID-revert the drive."
-        info "$notes"
+  if (( ! DRY_RUN )) && ! wait_for_leftover_sanitize "$dev"; then
+    notes=${LADDER_STOP:-"A sanitize left running by an earlier attempt did not finish."}
+    LADDER_STOP=${LADDER_STOP:-x}
+  fi
+  CUR_METHOD=""; CUR_DESC=""
+
+  if [[ -z $LADDER_STOP ]]; then
+    canary_plant "$dev" "$dir" || { planted=0; notes="canary write failed (drive may be locked: SED/Opal or ATA password)"; info "$notes"; }
+
+    while IFS='|' read -r m desc; do
+      if skip_reason "$dev" "$m" >/dev/null; then
+        log "--- skipping: $desc ($(skip_reason "$dev" "$m"))"; continue
       fi
-      # A drive left with an ATA password locks itself at next power-on.
-      # Never report such a drive as OK, whatever later methods achieve.
-      if [[ -e $STATE_DIR/pwstuck.$(devname "$dev") ]]; then
-        notes="ATA password '$ATA_PASS' is still set; the drive will be locked at next power-on. Unlock from the root shell: hdparm --user-master u --security-disable $ATA_PASS $dev"
-        break
+      log "--- trying: $desc"
+      CUR_METHOD=$m; CUR_DESC=$desc
+      if ! apply_method "$dev" "$m"; then
+        info "method failed: $desc"
+        if [[ $m == nvme-* && -z $notes ]] && tcg_locking_enabled "$(nvme_ctrl "$dev")"; then
+          notes="Self-encryption locking (TCG Opal) is enabled on this drive and may be blocking firmware erase. Remove the BIOS hard disk password or BitLocker hardware encryption, or PSID-revert the drive."
+          info "$notes"
+        fi
+        # A drive left with an ATA password locks itself at next power-on.
+        # Never report such a drive as OK, whatever later methods achieve.
+        if [[ -e $STATE_DIR/pwstuck.$(devname "$dev") ]]; then
+          notes="ATA password '$ATA_PASS' is still set; the drive will be locked at next power-on. Unlock from the root shell: hdparm --user-master u --security-disable $ATA_PASS $dev"
+          break
+        fi
+        [[ -n $LADDER_STOP ]] && { notes=$LADDER_STOP; break; }
+        continue
       fi
-      continue
-    fi
-    if (( DRY_RUN )); then used=$m; result="DRY-RUN"; break; fi
-    if canaries=$(canary_check "$dev" "$dir"); then
-      info "verified: $canaries canaries erased"
-      used=$m; result="OK"; break
-    fi
-    info "verification failed after $desc (canaries erased: $canaries); trying next method"
-  done < <(methods_for "$dev")
+      if (( DRY_RUN )); then used=$m; result="DRY-RUN"; break; fi
+      if canaries=$(canary_check "$dev" "$dir"); then
+        info "verified: $canaries canaries erased"
+        used=$m; result="OK"; break
+      fi
+      info "verification failed after $desc (canaries erased: $canaries); trying next method"
+    done < <(methods_for "$dev")
+  fi
+  CUR_METHOD=""; CUR_DESC=""
 
   if [[ $result == OK || $result == DRY-RUN ]]; then
     finalize "$dev"
     (( planted )) || notes="verified by readback only; ${notes}"
-  elif [[ $notes == "canary write failed"* ]]; then
-    notes="$notes. If this is a self-encrypting drive, run a PSID revert using the PSID printed on its label."
+  else
+    [[ $notes == "canary write failed"* ]] && notes="$notes. If this is a self-encrypting drive, run a PSID revert using the PSID printed on its label."
+    local st; st=$(sanitize_status_of "$dev")
+    [[ -n $st ]] && { info "$st"; notes="${notes:+$notes }$st"; }
   fi
   log "=== $dev: $result via $used (grade: $(grade_of "$used"))"
   report "$dev" "$class" "$used" "$result" "$canaries" "$notes"
   rm -rf "$dir"
+  CUR_DEV=""
   [[ $result == OK || $result == DRY-RUN ]]
+}
+
+# Ctrl+C (or the service being stopped) during an erase: record what was
+# interrupted, so the summary screen and the report can say so.
+on_interrupt() {
+  trap '' INT TERM HUP
+  echo >&2
+  log "INTERRUPTED by operator"
+  local dev notes st
+  if [[ -n $CUR_DEV ]]; then
+    case $CUR_METHOD in
+      ata-secure-erase) clear_temp_password "$CUR_DEV" >/dev/null 2>&1 ;;
+    esac
+    if [[ -n $CUR_METHOD ]]; then
+      notes="Stopped by operator during $CUR_DESC. Treat this drive as NOT erased: some or all data may remain."
+      case $CUR_METHOD in
+        *sanitize*) notes+=" The drive's firmware keeps erasing on its own once started, and refuses access until it finishes or is power-cycled." ;;
+        ata-secure-erase) notes+=" Security Erase cannot be cancelled inside the drive; run the erase again to finish and verify it." ;;
+      esac
+    else
+      notes="Stopped by operator before erasing began. The drive was not erased."
+    fi
+    [[ -e $STATE_DIR/pwstuck.$(devname "$CUR_DEV") ]] && notes+=" ATA password '$ATA_PASS' is still set; unlock from the root shell: hdparm --user-master u --security-disable $ATA_PASS $CUR_DEV"
+    st=$(sanitize_status_of "$CUR_DEV")
+    [[ -n $st ]] && { info "$st"; notes+=" $st"; }
+    report "$CUR_DEV" "$(classify "$CUR_DEV")" "${CUR_METHOD:-none}" INTERRUPTED - "$notes"
+  fi
+  for dev in "${PENDING_DEVS[@]}"; do
+    report "$dev" "$(classify "$dev")" none "NOT STARTED" - "Not erased: stopped by operator before this drive was started."
+  done
+  [[ -n ${CUR_DIR:-} ]] && rm -rf "$CUR_DIR"
+  touch "$STATE_DIR/interrupted"
+  sync
+  exit 130
 }
 
 cmd_erase() {
@@ -668,9 +936,15 @@ cmd_erase() {
   done
   init_logs
   : > "$STATE_DIR/summary"
-  rm -f "$STATE_DIR/suspended"
+  rm -f "$STATE_DIR/suspended" "$STATE_DIR/interrupted"
+  trap on_interrupt INT TERM HUP
   local w; while read -r w; do [[ -n $w ]] && log "WARNING: $w"; done < <(platform_warnings)
-  for dev in "$@"; do erase_one "$dev" || fails=$(( fails + 1 )); done
+  PENDING_DEVS=("$@")
+  for dev in "$@"; do
+    PENDING_DEVS=("${PENDING_DEVS[@]:1}")
+    erase_one "$dev" || fails=$(( fails + 1 ))
+  done
+  trap - INT TERM HUP
   sync
   log "done: $(( $# - fails ))/$# drives erased. Log: $RUN_LOG"
   (( fails == 0 ))

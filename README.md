@@ -17,6 +17,9 @@ A bootable USB that erases every internal drive in a PC and leaves it ready for 
 
 4. **Verification:** before erasing, 16 random 4 KiB "canary" blocks are written across the drive. After erasing, each is read back. The method only counts as successful if every canary is gone. If not, the next method runs.
 5. Each result is graded: **Purge** (firmware erase of the whole drive), **Clear** (every block overwritten once; SSD spare areas not reached), or **Logical** (TRIM only, no longer used as a final step).
+   **Stalls:** a firmware sanitize reports progress as a counter out of 65,535, so a working drive moves it every few seconds. If it does not move for 5 minutes (30 for hard drives), WipeStick gives up on that method. If the drive has left the sanitize, the next method runs; if it is still busy with it, the drive refuses everything else until it is power-cycled, so WipeStick stops on that drive and says so. Stalled methods are recorded in `wipelogs/stalled-drives.txt` (by drive serial) and skipped on later runs; delete a line to try that method again. A sanitize still running from an earlier attempt (it survives reboots) is waited for before anything else.
+   **Stopping:** Ctrl+C during an erase stops WipeStick and shows a "Process interrupted by user" summary. Drives marked INTERRUPTED or NOT STARTED are not erased. A firmware erase that has already started keeps running inside the drive.
+   On any failure, stall or interruption, the summary shows each drive's current sanitize status.
 6. Partition tables and filesystem signatures are wiped (`wipefs`, `sgdisk --zap-all`). The disk is blank; Windows or Linux installers take it as-is.
 7. A JSON-lines report (host model/serial, drive model/serial, method, result) and a full log are saved to `wipelogs/` on the stick.
 
@@ -102,7 +105,7 @@ The self-test only runs when the VM's SMBIOS OEM strings contain `wipestick-self
 
 ## Test status
 
-Tested in QEMU (no real hardware yet):
+Tested in QEMU:
 
 | Test | Ubuntu (casper) | Debian boot path (live-boot)* | Debian build (live-build) |
 |---|---|---|---|
@@ -119,6 +122,8 @@ Tested in QEMU (no real hardware yet):
 **First real-hardware run (Dell OptiPlex 3030 AIO, SanDisk X300 128 GB SATA SSD, v0.1.0):** ATA Sanitize was rejected by the drive (hdparm still reported it as started; the canaries caught it). The firmware had the drive frozen; suspend/resume unfroze it, and ATA Security Erase (enhanced) completed and verified 16/16 in about 9 minutes. The display did not come back after resume because v0.1.0 booted with `nomodeset`; v0.1.2 loads the Intel graphics driver by default to fix this (not yet confirmed on that machine).
 
 **Second real-hardware run (Lenovo ThinkPad X1 Carbon 6th gen, Intel SSDPEKKF256G8L NVMe, v0.1.2):** the drive offers no Sanitize, and rejected NVMe Format (SES=2 and SES=1) with Command Sequence Error. That held after a suspend/resume, and its TCG Opal locking was off, so the cause is still unknown. v0.1.2 fell back to TRIM; v0.1.3 falls back to a zero pass plus TRIM (Clear) instead, and records the drive's Opal state.
+
+**Third real-hardware run (same OptiPlex 3030 AIO and SanDisk X300, v0.1.4, legacy BIOS boot):** this time the drive accepted ATA Sanitize (block erase), but its progress counter sat at 0x5b (0%) for over 7 minutes until the operator stopped it. The partitions were still readable after a reboot, so nothing had been erased. v0.1.5 adds stall detection, skips a stalled method on later runs, and handles Ctrl+C with a summary screen. The stall, skip and interrupt paths were tested against a simulated drive replaying this one's responses; the fix has not been run on the machine yet.
 
 **Not yet tested on real drives:** NVMe Sanitize, NVMe crypto Format, and a successful ATA Sanitize. QEMU does not emulate these. Test them on a few spare machines before relying on the tool, and start with `--dry-run` from the root shell.
 
